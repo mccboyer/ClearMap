@@ -14,7 +14,7 @@ See also
 :mod:`ClearMap.Analysis.Measurements`.
 """
 __author__    = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__   = 'GPLv3 - GNU General Pulic License v3 (see LICENSE)'
+__license__   = 'GPLv3 - GNU General Public License v3 (see LICENSE)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__   = 'http://idisco.info'
 __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
@@ -360,7 +360,7 @@ def find_smaller_than_values(source, points, search, values, sink = None, proces
 
 def test():
   import numpy as np
-  import ClearMap.Analysis.Measurements.MeasureRadius as mr;
+  import ClearMap.Analysis.Measurements.radius_measurements as mr;
   import ClearMap.ParallelProcessing.DataProcessing.MeasurePointList as mpl
   
   from importlib import reload

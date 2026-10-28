@@ -1,7 +1,7 @@
 #TODO: integrate fully in ClearMap
 
 __author__    = 'Sophie Skriabin, Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__   = 'GPLv3 - GNU General Pulic License v3 (see LICENSE.txt)'
+__license__   = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__   = 'http://idisco.info'
 __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
@@ -165,4 +165,4 @@ if __name__ == '__main__':
     # # viewFile('/media/sophie.skriabine/TOSHIBA EXT/Sophie/teryData/arteryData/data_arteries_crust.npy')
     # arr=np.load('/mnt/vol00-renier/Nicolas/data_binary.npy')
     # plot3d(arr)
-    # show()GXFGv
+    # show()

@@ -3,12 +3,132 @@
 IO
 ==
 
-IO interface to read files as sources.
+Unified IO interface for all ClearMap data sources.
 
-This is the main module to distribute the reading and writing of 
-individual data formats to the specialized submodules.
-  
-See :mod:`ClearMap.IO` for details.
+This module is the single entry point for reading, writing, and inspecting
+data in any format that ClearMap understands.  It dispatches every call to the
+appropriate format-specific sub-module based on the type or file extension of
+the source, so calling code never needs to import ``TIF``, ``MMP``, ``NPY``,
+etc. directly.
+
+Supported formats
+-----------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 20 65
+
+   * - Extension
+     - Module
+     - Notes
+   * - ``.npy``
+     - :mod:`~ClearMap.IO.MMP`
+     - Memory-mapped NumPy arrays (default for large 3-D volumes)
+   * - ``.tif`` / ``.tiff``
+     - :mod:`~ClearMap.IO.TIF`
+     - Single files and file-list expressions
+   * - ``.nrrd`` / ``.nrdh``
+     - :mod:`~ClearMap.IO.NRRD`
+     -
+   * - ``.mhd``
+     - :mod:`~ClearMap.IO.MHD`
+     - MetaImage header + raw data
+   * - ``.csv``
+     - :mod:`~ClearMap.IO.CSV`
+     - Point / coordinate tables
+   * - ``.gt``
+     - :mod:`~ClearMap.IO.GT`
+     - graph-tool graphs (optional dependency)
+   * - ``<tag expression>``
+     - :mod:`~ClearMap.IO.FileList`
+     - Ordered lists of files matched by a tag expression
+   * - ``np.ndarray``
+     - :mod:`~ClearMap.IO.NPY`
+     - In-memory NumPy arrays
+   * - ``np.memmap``
+     - :mod:`~ClearMap.IO.MMP`
+     - Memory maps passed directly
+   * - shared memory
+     - :mod:`~ClearMap.IO.SMA`
+     - Shared-memory arrays for parallel processing
+
+Source routing
+--------------
+:func:`source_to_module` maps any source specification to its handler module:
+
+* A :class:`~ClearMap.IO.Source.Source` instance → the module that created it.
+* A ``str`` or :class:`~ClearMap.Utils.tag_expression.Expression` →
+  :func:`location_to_module` (file-list expression, or extension lookup).
+* A ``np.ndarray`` / ``list`` / ``tuple`` →
+  :mod:`~ClearMap.IO.SMA` if in shared memory, else :mod:`~ClearMap.IO.NPY`.
+* A ``np.memmap`` → :mod:`~ClearMap.IO.MMP`.
+
+Core functions
+--------------
+
+**Reading and writing**
+
+.. code-block:: python
+
+    import ClearMap.IO.IO as io
+
+    data  = io.read('signal.tif')            # returns np.ndarray
+    data  = io.read('volume.npy',
+                    slicing=(slice(0, 100),)) # sub-slice
+    io.write('output.tif', data)
+
+**Source objects** — richer than raw arrays; carry shape, dtype, and location:
+
+.. code-block:: python
+
+    src = io.as_source('volume.npy')
+    print(src.shape, src.dtype, src.order)
+    data = src[10:20, :, :]               # lazy slicing
+
+**Initialising a sink** before parallel workers write into it:
+
+.. code-block:: python
+
+    # Open existing file or create it if absent
+    sink = io.initialize('counts.npy',
+                         shape_=(512, 512, 256),
+                         dtype_=np.uint16,
+                         order_='F')
+
+**File-list expressions** — match tiles with tag patterns:
+
+.. code-block:: python
+
+    files = io.file_list('raw/tile_<X,2>_<Y,2>.tif')
+
+**Bulk conversion** between formats (parallelised):
+
+.. code-block:: python
+
+    io.convert_files(files, extension='.npy', processes=8)
+
+Property helpers
+----------------
+:func:`shape`, :func:`dtype`, :func:`order`, :func:`location`,
+:func:`element_strides`, :func:`memory`, :func:`buffer` —
+each accepts any source specification (path, array, or
+:class:`~ClearMap.IO.Source.Source`) and returns the corresponding attribute
+without requiring the caller to construct a Source explicitly.
+
+File-path utilities
+-------------------
+The following functions from :mod:`~ClearMap.IO.FileUtils` are re-exported
+here for convenience:
+``is_file``, ``is_directory``, ``file_extension``, ``join``, ``split``,
+``abspath``, ``create_directory``, ``delete_directory``, ``copy_file``,
+``link_file``, ``delete_file``.
+
+See also
+--------
+:mod:`ClearMap.IO.Source` : Base Source class and AbstractSource / VirtualSource.
+:mod:`ClearMap.IO.MMP`    : Memory-mapped arrays (primary large-data format).
+:mod:`ClearMap.IO.FileList` : Tag-expression file lists.
+:mod:`ClearMap.IO.workspace2` : High-level asset management built on top of this module.
 """
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
 __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
@@ -26,7 +146,7 @@ import multiprocessing as mp
 import warnings
 
 import numpy as np
-
+import pandas as pd
 
 import ClearMap.IO.Source as src
 import ClearMap.IO.Slice as slc
@@ -96,8 +216,8 @@ def source_to_module(source_):
     """
     Returns IO module associated with a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : object
         The source specification.
 
@@ -130,8 +250,8 @@ def location_to_module(location_):
     """
     Returns the IO module associated with a location string.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     location_ : str or te.Expression or pathlib.Path
         Location of the source.
 
@@ -152,8 +272,8 @@ def filename_to_module(filename):
     """
     Returns the IO module associated with a filename.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     filename : str
        The file name.
 
@@ -189,8 +309,8 @@ def is_source(source_, exists=True):
     """
     Checks if `source_` is a valid Source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : object
         Source to check.
     exists : bool
@@ -228,10 +348,12 @@ def as_source(source_, slicing=None, *args, **kwargs):
     """
     Convert source specification to a Source class.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : object
         The source specification.
+    slicing : int, slice, list of slices or None
+        Optional slicing to apply to the source after opening.
 
     Returns
     -------
@@ -253,8 +375,8 @@ def source(source_, slicing=None, *args, **kwargs):
     """
     Convert source specification to a Source class.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : object
         The source specification.
 
@@ -270,8 +392,8 @@ def ndim(source_):
     """
     Returns number of dimensions of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -280,7 +402,7 @@ def ndim(source_):
     ndim : int
         The number of dimensions in the source.
     """
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     return source_.ndim
 
 
@@ -288,8 +410,8 @@ def shape(source_):
     """
     Returns shape of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_: str, array or Source
        The source specification.
 
@@ -298,7 +420,7 @@ def shape(source_):
     shape : tuple of ints
        The shape of the source.
     """
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     return source_.shape
 
 
@@ -306,8 +428,8 @@ def size(source_):
     """
     Returns size of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -316,7 +438,7 @@ def size(source_):
     size : int
         The size of the source.
     """
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     return source_.size
 
 
@@ -324,8 +446,8 @@ def dtype(source_):
     """
     Returns dtype of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -334,7 +456,7 @@ def dtype(source_):
     dtype : dtype
         The data type of the source.
     """
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     return source_.dtype
 
 
@@ -342,8 +464,8 @@ def order(source_):
     """
     Returns order of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -352,7 +474,7 @@ def order(source_):
     order : 'C', 'F', or None
         The order of the source data items.
     """
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     return source_.order
 
 
@@ -360,8 +482,8 @@ def location(source_):
     """
     Returns the location of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -370,7 +492,9 @@ def location(source_):
     location : str or None
         The location of the source.
     """
-    source_ = as_source(source_)
+    if isinstance(source_, (str, pathlib.Path)) and not pathlib.Path(source_).exists():  # TODO: check if we **want** that bhv
+        return source_
+    source_ = open_ro(source_)
     return source_.location
 
 
@@ -378,8 +502,8 @@ def memory(source_):
     """
     Returns the memory type of `source_`.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array or Source
         The source specification.
 
@@ -399,8 +523,8 @@ def element_strides(source_):
     """
     Returns the strides of the data array of a source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array, dtype or Source
         The source specification.
 
@@ -410,7 +534,7 @@ def element_strides(source_):
         The strides of the source.
     """
     try:
-        source_ = as_source(source_)
+        source_ = open_ro(source_)
         strides = source_.element_strides
     except Exception as e:
         raise ValueError(f'Cannot determine the strides for the source!; {e}')
@@ -422,8 +546,8 @@ def buffer(source_):
     """
     Returns an io buffer of the data array of a source for use with e.g. cython.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : source specification
       The source specification.
 
@@ -441,14 +565,23 @@ def buffer(source_):
     return buffer_
 
 
+def _is_feather_path(source_) -> bool:
+    return isinstance(source_, (str, pathlib.Path)) and str(source_).endswith('.feather')
+
+
 # TODO: arg memory= to specify which kind of array is created, better use device=
 # TODO: arg processes= in order to use ParallelIO -> can combine with buffer=
 def read(source_, *args, **kwargs):
     """
     Read data from a data source.
 
-    Arguments
-    ---------
+    .. warning::
+        For some modules (file types) this does an active read
+        for others, it just does an open and returns a Source class
+        that can be used to read the data.
+
+    Parameters
+    ----------
     source_ : str, pathlib.Path, array, Source class
        The source to read the data from.
 
@@ -459,16 +592,58 @@ def read(source_, *args, **kwargs):
     """
     if isinstance(source_, pathlib.Path):
         source_ = str(source_)
+    if _is_feather_path(source_):
+        return pd.read_feather(source_)
+    elif isinstance(source_, np.ndarray):  # Already materialised — nothing to do
+        return source_
+    elif isinstance(source_, src.Source):  # Source-like with .array (Block, Slice, NPY.Source, MMP.Source, ...)
+        if hasattr(source_, 'array'):
+            return source_.array
+        raise ValueError(f'Source {source_} has no array property and cannot be read directly')
+
+    # File path or expression — dispatch to the right module
     mod = source_to_module(source_)
     return mod.read(source_, *args, **kwargs)
+
+
+def open_ro(source_, **kwargs):
+    """Open a source strictly read-only for metadata queries."""
+    if isinstance(source_, pathlib.Path):
+        source_ = str(source_)
+    if _is_feather_path(source_):
+        return pd.read_feather(source_)
+    mod = source_to_module(source_)
+    if isinstance(source_, src.Source):
+        if source_.mode == 'r':
+            return source_
+        if hasattr(mod, 'open_ro'):
+            return mod.open_ro(source_, **kwargs)
+        return source_  # non-MMP Sources are read-only at API level already
+    else:  # e.g. string
+        if hasattr(mod, 'open_ro'):
+            return mod.open_ro(source_, **kwargs)
+    # no open_ro available -> fallback: construct with mode='r'
+    return mod.Source(source_, mode='r', **kwargs)
+
+
+def edit(source_, **kwargs):
+    """Open a source for in-place editing (mode='r+')."""
+    if isinstance(source_, pathlib.Path):
+        source_ = str(source_)
+    if _is_feather_path(source_):
+        return pd.read_feather(source_)
+    mod = source_to_module(source_)
+    if hasattr(mod, 'edit'):
+        return mod.edit(source_, **kwargs)
+    return as_source(source_, **kwargs)  # FIXME: explicit mode = r+
 
 
 def write(sink, data, *args, **kwargs):
     """
     Write data to a data source.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     sink : str, pathlib.Path, array, Source class
         The source to write data to.
     data : array
@@ -483,16 +658,23 @@ def write(sink, data, *args, **kwargs):
     """
     if isinstance(sink, pathlib.Path):
         sink = str(sink)
+    if _is_feather_path(sink):
+        if not isinstance(data, pd.DataFrame):
+            data = pd.DataFrame(data)  # backward compat: structured array
+        if not isinstance(data.index, pd.RangeIndex) or data.index[0] != 0:
+            data = data.reset_index(drop=True)  # feather requires default RangeIndex
+        data.to_feather(sink)
+        return sink
     mod = source_to_module(sink)
-    return mod.write(sink, as_source(data), *args, **kwargs)
+    return mod.write(sink, open_ro(data), *args, **kwargs)
 
 
 def create(source_, *args, **kwargs):
     """
     Create a data source on disk.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, pathlib.Path, array, Source class
         The source to write data to.
 
@@ -507,18 +689,18 @@ def create(source_, *args, **kwargs):
     return mod.create(source_, *args, **kwargs)
 
 
-def initialize(source_=None, shape_=None, dtype_=None, order_=None, location_=None,
-               memory_=None, like=None, hint=None, **kwargs):
+def initialize(source_=None, shape_=None, dtype_=None,
+               order_=None, location_=None, memory_=None, like=None, hint=None, **kwargs):
     """
-    Initialize a source with specified properties.
+    Initialize (open to edit or create if missing) a source with specified properties.
 
     Note
     ----
     The source is created on disk or in memory if it does not exist so processes
     can start writing into it.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array, Source class
         The source to write data to.
     shape_ : tuple or None
@@ -562,11 +744,15 @@ def initialize(source_=None, shape_=None, dtype_=None, order_=None, location_=No
 
     if source_ is None:
         if location_ is not None:  # No source but a path
-            try:
-                source_ = as_source(location_)  # First, attempt to read the source
+            try: # First, attempt to read the source in 'edit' mode
+                mod = location_to_module(location_)
+                if hasattr(mod, 'edit'):
+                    source_ = mod.edit(location_)
+                else:
+                    source_ = as_source(location_, mode='r+')  # FIXME: check if we nuke existing data here, maybe we need an argument erase=False and/or a warning
             except (FileNotFoundError, ValueError) as err:  # No file found, then create # TODO: see if nore exceptions are needed
                 if isinstance(err, ValueError):
-                    if not str(err).startswith('Cannot create memmap without shape at location'):
+                    if not str(err).startswith('Cannot create memmap without shape at location'):  # FIXME: msg too specific, use ClearMap specific exception class
                         raise err
                 try:
                     if os.path.exists(location_):
@@ -578,7 +764,6 @@ def initialize(source_=None, shape_=None, dtype_=None, order_=None, location_=No
                                              f'shape {shape_}, dtype {dtype_}, order {order_}; '
                                              f'file exists with shape {parsed_shape}, dtype {parsed_dtype}, order {parsed_order}')
                     shape_, dtype_, order_ = _from_hint(hint, shape_, dtype_, order_)
-                    mod = location_to_module(location_)
                     return mod.create(location=location_, shape=shape_, dtype=dtype_, order=order_, **kwargs)
                 except Exception as error:
                     raise ValueError(f'Cannot initialize source for location {location_}; {error}')
@@ -597,8 +782,9 @@ def initialize(source_=None, shape_=None, dtype_=None, order_=None, location_=No
         raise ValueError(f'Source specification {source_} not a valid location, array or Source class!')
 
     current_vars = locals()
-    for attr in ('shape', 'dtype', 'order'):
-        if current_vars.get(attr) is not None and current_vars[attr] != getattr(source_, attr, None):
+    for attr in ('shape_', 'dtype_', 'order_'):
+        base_attr = attr[:-1]
+        if current_vars.get(attr) is not None and current_vars[attr] != getattr(source_, base_attr, None):
             raise IncompatibleSource(source_, attr, current_vars)
 
     if location_ is not None and abspath(location_) != abspath(source_.location):
@@ -611,7 +797,7 @@ def initialize(source_=None, shape_=None, dtype_=None, order_=None, location_=No
 
 def _from_like(like, shape, dtype, order):
     if like is not None:
-        like = as_source(like)
+        like = open_ro(like)
         if shape is None:
             shape = like.shape
         if dtype is None:
@@ -634,8 +820,8 @@ def initialize_buffer(source_, shape=None, dtype=None, order=None, location=None
     """
     Initialize a buffer with specific properties.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array, Source class
         The source to write data to.
     shape : tuple or None
@@ -680,8 +866,8 @@ def file_list(expression=None, file_list=None, sort=True, verbose=False):
     """
     Returns the list of files that match the tag expression.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     expression :str | Path | te.Expression | None
         The regular expression the file names should match.
     sort : bool
@@ -737,7 +923,7 @@ def get_value(source_, value_type):  # REFACTOR: should be moved to io_utils or 
         source_ = str(source_)
 
     if value_type not in ['min', 'max']:
-        raise ValueError(f'Unknown value type {value_type}, accepted arguments are "min" and "max"!')
+        raise ValueError(f'Unknown value type {value_type}, accepted Parameters are "min" and "max"!')
 
     if isinstance(source_, (src.Source, np.ndarray)):
         source_ = source_.dtype
@@ -762,8 +948,8 @@ def min_value(source_):
     """
     Returns the minimal value of a source data type.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array, dtype or Source
         The source specification.
 
@@ -779,8 +965,8 @@ def max_value(source_):
     """
     Returns the maximal value of a source data type.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : str, array, dtype or Source
         The source specification.
 
@@ -797,8 +983,8 @@ def convert(source_, sink, processes=None, verbose=False, **kwargs):
     """
     Transforms a source into another format.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     source_ : source specification
         The source or list of sources.
     sink : source specification
@@ -811,7 +997,7 @@ def convert(source_, sink, processes=None, verbose=False, **kwargs):
     """
     if isinstance(sink, pathlib.Path):
         sink = str(sink)
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     if verbose:
         print(f'converting {source_} -> {sink}')
     mod = source_to_module(source_)
@@ -825,8 +1011,8 @@ def convert_files(filenames, extension=None, path=None, processes=None, verbose=
     """
     Transforms list of files to their sink format in parallel.
 
-    Arguments
-    ---------
+    Parameters
+    ----------
     filenames : list of str | list of pathlib.Path
         The filenames to convert
     extension : str
@@ -884,7 +1070,7 @@ def convert_files(filenames, extension=None, path=None, processes=None, verbose=
 
 @ptb.parallel_traceback
 def _convert_files(source_, sink, fid, n_files, extension, verbose, verify=False):
-    source_ = as_source(source_)
+    source_ = open_ro(source_)
     if verbose:
         print(f'Converting file {fid}/{n_files} {source_} -> {sink}')
     mod = file_extension_to_module[extension]
@@ -924,7 +1110,7 @@ def _test():
 # def copy(source, sink):
 #    """Copy a data file from source to sink, which can consist of multiple files
 #    
-#    Arguments:
+#    Parameters:
 #        source (str): file name of source
 #        sink (str): file name of sink
 #    
@@ -941,7 +1127,7 @@ def _test():
 # def convert(source, sink, **args):
 #    """Transforms data from source format to sink format
 #    
-#    Arguments:
+#    Parameters:
 #        source (str): file name of source
 #        sink (str): file name of sink
 #    
@@ -990,7 +1176,7 @@ def _test():
 # def writeTable(filename, table):
 #    """Writes a numpy array with column names to a csv file.
 #    
-#    Arguments:
+#    Parameters:
 #        filename (str): filename to save table to
 #        table (annotated array): table to write to file
 #        
@@ -1011,7 +1197,7 @@ def _test():
 # def isFileExpression(source):
 #    """Checks if filename is a regular expression denoting a file list
 #    
-#    Arguments:
+#    Parameters:
 #        source (str): source file name
 #        
 #    Returns:
@@ -1049,7 +1235,7 @@ def _test():
 # def isDataFile(source, exists = False):
 #    """Checks if a file has a valid data file extension usable in *ClearMap*
 #     
-#    Arguments:
+#    Parameters:
 #        source (str): source file name
 #        exists (bool): if true also checks if source exists 
 #        
@@ -1073,7 +1259,7 @@ def _test():
 # def isImageFile(source, exists = False):
 #    """Checks if a file has a valid image file extension usable in *ClearMap*
 #     
-#    Arguments:
+#    Parameters:
 #        source (str): source file name
 #        exists (bool): if true also checks if source exists 
 #        
@@ -1097,7 +1283,7 @@ def _test():
 # def isArrayFile(source, exists =False):
 #    """Checks if a file is a valid array data file
 #     
-#    Arguments:
+#    Parameters:
 #        source (str): source file name
 #        exists (bool): if true also checks if source exists 
 #        
@@ -1121,7 +1307,7 @@ def _test():
 # def isDataSource(source, exists = False):
 #  """Checks if source is a valid data source for use in *ClearMap*
 #   
-#  Arguments:
+#  Parameters:
 #      source (str): source file name or array
 #      exists (bool): if true also checks if source exists 
 #      

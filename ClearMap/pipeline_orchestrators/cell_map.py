@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CellMap
-=======
+cell_map
+========
 
-This module contains the class to analyze (detect) individual cells,
-e.g. to analyze immediate early gene expression data from iDISCO+ cleared tissue [Renier2016]_.
+Per-channel cell detection, filtering, atlas alignment, and density mapping.
 
+:class:`CellDetector` is the pipeline worker for the CellMap pipeline, initially
+developped to analyze immediate early gene expression data from iDISCO+ cleared tissue [Renier2016]_.
 
 .. image:: ../static/cell_abstract_2016.jpg
    :target: https://doi.org/10.1016/j.cell.2020.01.028
@@ -16,6 +17,66 @@ e.g. to analyze immediate early gene expression data from iDISCO+ cleared tissue
 
   iDISCO+ and ClearMap: A Pipeline for Cell Detection, Registration, and 
   Mapping in Intact Samples Using Light Sheet Microscopy.
+
+
+`CellDetector` processes a single fluorescence channel through the following steps:
+
+1. **Cell detection** (:meth:`~CellDetector.run_cell_detection`) —
+   background subtraction, maxima detection, and shape-based watershed
+   segmentation via :mod:`~ClearMap.ImageProcessing.Experts.Cells`.
+   Produces a raw cell table (``cells_raw``).
+2. **Filtering** (:meth:`~CellDetector.filter_cells`) —
+   thresholds on size and intensity; optional cortical-surface crust
+   removal.  Produces a filtered table (``cells_filtered``).
+3. **Atlas alignment** (:meth:`~CellDetector.atlas_align`) —
+   transforms coordinates into atlas space via Elastix and annotates
+   each cell with brain-region labels, hemisphere, and structure volume.
+   Produces a per-cell Feather table.
+4. **Voxelization** (:meth:`~CellDetector.voxelize`) —
+   rasterises cell positions (with optional intensity weighting) into a
+   density volume at atlas resolution for group statistics.
+5. **Statistics export** (:meth:`~CellDetector.export_collapsed_stats`) —
+   aggregates per-cell data into a per-structure CSV with counts, average
+   size, and volumes for both hemispheres.
+
+Configuration
+-------------
+Parameters are read from the ``cell_map`` config section:
+
+* ``detection.background_correction.diameter``
+* ``detection.maxima_detection.shape`` / ``h_max``
+* ``detection.shape_detection.threshold``
+* ``cell_filtration.thresholds.size`` / ``intensity``
+* ``voxelization.radii``
+
+Typical usage
+-------------
+Instances are normally created via
+:class:`~ClearMap.pipeline_orchestrators.experiment_controller.ExperimentController`::
+
+    detector = exp_ctrl.get_worker('cell_map', channel='cfos')
+    detector.run_cell_detection()
+    detector.filter_cells()
+    detector.atlas_align()
+    detector.voxelize()
+    detector.export_collapsed_stats()
+
+For scripted use without the GUI::
+
+    from ClearMap.pipeline_orchestrators.sample_info_management import build_sample_manager
+    from ClearMap.pipeline_orchestrators.cell_map import CellDetector
+
+    sm  = build_sample_manager('/path/to/experiment')
+    det = CellDetector(sm, sm.cfg_coordinator,
+                       channel='cfos', registration_processor=reg)
+    det.run_cell_detection()
+
+See also
+--------
+:mod:`ClearMap.ImageProcessing.Experts.Cells` : Low-level detection algorithms.
+:class:`~ClearMap.pipeline_orchestrators.registration_orchestrator.RegistrationProcessor` :
+    Required for atlas alignment.
+:mod:`ClearMap.Analysis.Measurements.Voxelization` : Density-map generation.
 """
 from __future__ import annotations
 
@@ -112,22 +173,22 @@ class CellDetector(ChannelPipelineOrchestrator):
             raise ValueError('CellDetector not properly initialized')
         self.patch_channel({'voxelization': {'radii': list(voxelization_radii)}})
 
-    def list_valid_weighing_columns(self, sub_step=''):
-        aligned = sub_step != ''
+    def list_valid_weighing_columns(self, sub_step: str | None= None):
+        aligned = sub_step not in ('raw', 'filtered')
         cells_df = self.get_coords(coord_type=sub_step, aligned=aligned)
         excluded_columns = {'id', 'name', 'order', 'color', 'volume'}
         return set(cells_df.columns) - excluded_columns
 
-    def voxelize(self, sub_step='', weights_column=None):        # FIXME: add uncrusting ?
+    def voxelize(self, sub_step: str | None=None, weights_column=None):        # FIXME: add uncrusting ?
         """
         Unweighted voxelization (i.e. cell counts)
         This will draw a sphere of radius r around each cell and increment the voxel values.
 
         Parameters
         ----------
-        sub_step: str
+        sub_step: str | None
             If specified, will use the coordinates from the specified sub_step (e.g. 'aligned')
-        weights_column: str
+        weights_column: str | None
             If specified, this column in the cells table will be used to add weights to the
             voxelization spheres (e.g. for intensity voxelization).
             The column must be present in the cells table.
@@ -136,7 +197,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         -------
             coordinates, counts_file_path: np.array, str
         """
-        if weights_column not in self.list_valid_weighing_columns(sub_step=sub_step):
+        if weights_column is not None and weights_column not in self.list_valid_weighing_columns(sub_step=sub_step):
             raise ValueError(f'Column {weights_column} is invalid. '
                              f'Valid options are {self.list_valid_weighing_columns(sub_step)}')
         coordinates, cells, voxelization_parameter = self.get_voxelization_params(sub_step=sub_step)
@@ -247,7 +308,7 @@ class CellDetector(ChannelPipelineOrchestrator):
             for i, channel in enumerate(self.get_registration_sequence_channels(stop_channel=target_channel)):
                 if reg_cfg[channel]['moving_channel'] in (None, 'intrinsically_aligned'):
                     continue
-                results_dir = self.get_path('aligned', channel=channel).parent
+                results_dir = self.registration_processor.get_path('aligned', channel=channel).parent
                 coords = elastix.transform_points(coords, transform_directory=results_dir, binary=USE_BINARY_POINTS_FILE)
 
         return coords
@@ -440,7 +501,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         particle_size = self.config['detection']['background_correction']['diameter'][0]
         dv.scatter_coords = Scatter3D(coordinates, colors=df['color'].to_list(),
                                       hemispheres=hemispheres,
-                                      half_slice_thickness=self.machine_config['particle_plot_z_sphere_radius'],
+                                      z_radius=self.machine_config['particle_plot_z_sphere_radius'],
                                       marker_size=max(3, particle_size // 2))
         dv.refresh()
         return [dv]
@@ -475,13 +536,14 @@ class CellDetector(ChannelPipelineOrchestrator):
         dv.view.addItem(scatter)
         dv.scatter = scatter
 
-        dv.scatter_coords = Scatter3D(coordinates, smarties=smarties, half_slice_thickness=3)
+        dv.scatter_coords = Scatter3D(coordinates, smarties=smarties,
+                                      z_radius=self.machine_config['particle_plot_z_sphere_radius'])
         dv.refresh()
         return [dv]
 
     def plot_background_subtracted_img(self):
         import ClearMap.Visualization.Plot3d as plot_3d
-        src = self.get('cells', channel=self.channel, asset_sub_type='raw').as_source()
+        src = self.get('cells', channel=self.channel, asset_sub_type='raw').open_ro()
         coordinates = np.hstack([src[c][:, None] for c in 'xyz'])
         p = plot_3d.list_plot_3d(coordinates)
         return plot_3d.plot_3d(self.get_path('stitched', channel=self.channel),
@@ -564,7 +626,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         """
         warnings.warn('Method "export_to_clearmap1_fmt" is deprecated and will be removed in future versions;'
                       'please use the new formats from atlas_align and export_collapsed_stats', DeprecationWarning, 2)
-        source = self.get('cells', channel=self.channel).as_source()
+        source = self.get('cells', channel=self.channel).read()
         clearmap1_format = {'points': ['x', 'y', 'z'],
                             'points_transformed': ['xt', 'yt', 'zt'],
                             'intensities': ['source', 'dog', 'background', 'size']}

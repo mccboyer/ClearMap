@@ -2,11 +2,82 @@
 sample_info_management
 ======================
 
-This is the part that pertains to the metadata and configuration of a sample.
-It manages the sample-level configurations and properties, handles configurations related to the sample,
-and provides utility methods for checking sample properties.
+Sample-level metadata management, configuration synchronisation,
+workspace reconciliation, and channel queries.
+
+:class:`SampleManager` is the **root object** for a single ClearMap
+experiment.  It owns the sample configuration (channel paths, resolutions,
+orientations, data types) and keeps the
+:class:`~ClearMap.IO.workspace2.Workspace2` in sync with it.
+Every pipeline worker receives a ``SampleManager`` reference so it can
+resolve asset paths without knowing the experiment layout.
+
+Responsibilities
+----------------
+
+**Configuration access**
+    :attr:`~SampleManager.channels`, :attr:`~SampleManager.data_types`,
+    :meth:`~SampleManager.get_channel_resolution`, etc. expose the sample
+    config as typed Python values, always reflecting the latest committed
+    state from :class:`~ClearMap.config.config_coordinator.ConfigCoordinator`.
+
+**Workspace reconciliation**
+    :meth:`~SampleManager.update_workspace` ensures the
+    :class:`~ClearMap.IO.workspace2.Workspace2` mirrors the current channel
+    list — adding missing channels, updating raw-data paths, pruning deleted
+    channels, and persisting ``workspace.yml``.
+
+**Channel queries**
+    :meth:`~SampleManager.get_channels_by_type`,
+    :meth:`~SampleManager.get_channels_by_pipeline`, and
+    :meth:`~SampleManager.get_channels_by_condition` provide filtered
+    lookups with configurable ``missing_action`` / ``multiple_found_action``
+    policies (``'ignore'``, ``'warn'``, ``'raise'``).
+
+**Pipeline discovery**
+    :meth:`~SampleManager.compute_relevant_pipelines` infers which
+    pipelines are active so the
+    :class:`~ClearMap.pipeline_orchestrators.experiment_controller.ExperimentController`
+    knows which config sections to load.
+
+**Asset access**
+    Inherits :meth:`~.generic_orchestrators.OrchestratorBase.get` and
+    :meth:`~.generic_orchestrators.OrchestratorBase.get_path`.
+
+``@adjuster_safe`` marker
+-------------------------
+Methods decorated with :func:`adjuster_safe` are safe to call from config
+adjusters before all channel configs are fully populated.
+:func:`check_protocol_coverage` verifies at module load time that every
+method in
+:class:`~ClearMap.config.config_adjusters.type_hints.SampleManagerProtocol`
+carries this marker.
+
+Bootstrapping
+-------------
+Use :func:`build_sample_manager` rather than constructing
+:class:`SampleManager` directly::
+
+    from ClearMap.pipeline_orchestrators.sample_info_management import build_sample_manager
+
+    sm = build_sample_manager('/path/to/experiment')
+
+    print(sm.channels)                              # ['cfos', 'autofluorescence']
+    print(sm.get_channels_by_pipeline('CellMap'))   # ['cfos']
+    print(sm.get_channel_resolution('cfos'))        # (1.625, 1.625, 3.0)
+
+    raw = sm.get('raw', channel='cfos')
+    print(raw.is_tiled, raw.tile_grid_shape)        # True, array([3, 4])
+
+See also
+--------
+:class:`~ClearMap.IO.workspace2.Workspace2` : Asset management layer.
+:class:`~ClearMap.pipeline_orchestrators.experiment_controller.ExperimentController` :
+    Owns SampleManager and wires it to pipeline workers.
+:mod:`ClearMap.IO.assets_constants` : ``CONTENT_TYPE_TO_PIPELINE`` mapping.
 """
 import atexit
+import getpass
 import os
 import re
 import shutil
@@ -327,8 +398,24 @@ class SampleManager(OrchestratorBase):
 
     def infer_channel_index_from_name(self, path: Path | str) -> int | None:
         """
-        Extracts Cxx from typical microscopy filenames, e.g. *_C00.ome.tif -> 0
-        Returns None if no Cxx is found.
+        Extract channel index from typical microscopy filenames.
+
+        Extracts Cxx from filenames like ``_C00.ome.tif`` -> 0.
+
+        Parameters
+        ----------
+        path : Path or str
+            Microscopy image filename.
+
+        Returns
+        -------
+        int or None
+            Channel index extracted from Cxx pattern, or None if not found.
+
+        Examples
+        --------
+            >>> infer_channel_index_from_name("image_C03.ome.tif")
+            3
         """
         path = Path(path)
         match = re.search(r"[Cc](\d{2})", path.name)
@@ -811,7 +898,7 @@ def _make_bootstrap_dir() -> Path:
     until the experiment folder is set by the user.
     We prefer a user-configured temp if available (CLEARMAP_TMP env var)
     otherwise use the system temp folder.
-    The folder is named "clearmap_bootstrap/session_<pid>" to avoid clashes
+    The folder is named "clearmap_bootstrap-<username>/session_<pid>" to avoid clashes
     if multiple instances are running.
     The folder is removed on exit if it stayed unused (i.e. still a bootstrap dir).
     Returns
@@ -820,7 +907,7 @@ def _make_bootstrap_dir() -> Path:
         The path to the temporary bootstrap directory
     """
     root = Path(os.environ.get('CLEARMAP_TMP', tempfile.gettempdir()))
-    session = root / 'clearmap_bootstrap' / f'session_{os.getpid()}'
+    session = root / f'clearmap_bootstrap-{getpass.getuser()}' / f'session_{os.getpid()}'
     session.mkdir(parents=True, exist_ok=True)
     return session
 

@@ -15,7 +15,7 @@ from ClearMap.Analysis.graphs import graph_gt
 from ClearMap.Analysis.graphs.graph_gt import Graph
 from ClearMap.ImageProcessing.machine_learning.vertices_classification.degree1_inference_utils import (run_inference, update_graph_properties,
                                                                                                        get_default_model_path)
-from ClearMap.processors.tube_map import BinaryVesselProcessor
+from ClearMap.pipeline_orchestrators.tube_map import BinaryVesselProcessor
 
 
 def export_vertex_coordinates(graph: Graph) -> pd.DataFrame:
@@ -99,8 +99,7 @@ def degree1_verification(sample_manager, model_weights_path=None, threshold=0.8,
         return
 
     # Load image and graph
-    image = stitched_asset.as_source(mode='r')
-    # image = np.load(stitched_path, mmap_mode="r").swapaxes(0, 2)
+    image = stitched_asset.open_ro()
     graph = graph_asset.read()
 
     # Prepare vertex coordinates (DataFrame)

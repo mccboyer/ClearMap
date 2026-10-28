@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (QWidget, QRadioButton, QLabel, QSplitter, QApplicat
                              QCheckBox, QGraphicsPathItem, QGridLayout, QLineEdit, QScrollArea, QFileDialog, QSpinBox)
 
 from ClearMap.Utils.utilities import runs_on_spyder
-from ClearMap.IO.IO import as_source
+from ClearMap.IO import IO as cmp_io
 from ClearMap.IO.Source import Source
 from ClearMap.Visualization.Qt.data_viewer_luts import LUT, HighLowLUT
 
@@ -46,6 +46,7 @@ if not pg.QAPP:
 
 
 class DataViewer(QWidget):
+    #: Triggered when the mouse is clicked in the image view. The signal emits the x, y, and z coordinates of the click.
     mouse_clicked = pyqtSignal(int, int, int)
 
     DEFAULT_SCATTER_PARAMS = {
@@ -87,7 +88,7 @@ class DataViewer(QWidget):
 
         self.points = points
         if self.points is not None:
-            self.points = as_source(points).array
+            self.points = cmp_io.read(points)
         self.points_item = None
         self.points_style = dict(pen=None, brush='white')
         if points_style is not None:
@@ -95,7 +96,7 @@ class DataViewer(QWidget):
 
         self.vectors = vectors
         if self.vectors is not None:
-            self.vectors = as_source(vectors).array
+            self.vectors = cmp_io.read(vectors)
         self.vectors_item = None
         self.vectors_base_item = None
         self.vectors_style = dict(pen=None, brush='lightblue')
@@ -104,7 +105,7 @@ class DataViewer(QWidget):
 
         self.orientations = orientations
         if self.orientations is not None:
-            self.orientations = as_source(orientations).array
+            self.orientations = cmp_io.read(orientations)
         self.orientations_item = None
         self.orientations_style = dict(pen='gray')
         if orientations_style is not None:
@@ -384,7 +385,7 @@ class DataViewer(QWidget):
         # initialize sources and axis settings
         source = self.__cast_source(source)
         self.n_sources = len(source)
-        self.sources = [as_source(s) for s in source]
+        self.sources = [cmp_io.open_ro(s) for s in source]
         for s in self.sources:
             if s.ndim == 2:
                 s.shape = s.shape + (1,)  # Add empty z dimension # FIXME: see if works or need to expand_dims
@@ -419,11 +420,11 @@ class DataViewer(QWidget):
             source = self.__cast_source(source)
             if self.n_sources != len(source):
                 raise RuntimeError(f'Number of sources does not match! got {len(source)}, expected {self.n_sources}')
-            source = [as_source(s) for s in source]
+            source = [cmp_io.open_ro(s) for s in source]
             index = range(self.n_sources)
         else:
             s = self.sources
-            s[index] = as_source(source)
+            s[index] = cmp_io.open_ro(source)
             source = s
             index = [index]
 
@@ -701,14 +702,6 @@ class DataViewer(QWidget):
         self.scatter.clear()
         self.scatter_coords.axis = ax
 
-        # x_range, y_range = self.view.viewRange()
-        # Compute scale from the ratio between original and current view range
-        # scale_x = self.source_range_x / (x_range[1] - x_range[0])
-        # scale_y = self.source_range_y / (y_range[1] - y_range[0])
-        # zoom_factor = (scale_x + scale_y) / 2.0
-        #
-        # scaled_size = round(self.scatter_coords.marker_size * zoom_factor)
-
         scaled_size, zoom_factor = self._scale_markers()
         pos = self.scatter_coords.get_pos(index)
         if all(pos.shape):
@@ -720,10 +713,11 @@ class DataViewer(QWidget):
             else:
                 self.scatter.setData(pos=pos, **DataViewer.DEFAULT_SCATTER_PARAMS.copy())  # TODO: check if copy required
         try:  # TODO: check why some markers trigger errors
-            if self.scatter_coords.half_slice_thickness is not None and self.scatter_coords.half_slice_thickness > 0:
-                marker_params = self.scatter_coords.get_all_data(index)
-                if marker_params['pos'].shape[0]:
-                    marker_params['size'] *= zoom_factor
+            if self.scatter_coords.z_radius is not None and self.scatter_coords.z_radius > 0:
+                marker_params = self.scatter_coords.get_3d_markers(
+                    index, base_size=self.marker_size_spin.value())
+                if marker_params['pos'].shape[0]:  # We have markers in view
+                    marker_params['size'] = np.round(marker_params['size'] * zoom_factor).astype(int)
                     self.scatter.addPoints(brush=pg.mkBrush((0, 0, 0, 0)), **marker_params)
         except KeyError as err:
             print(f'DataViewer error: {err}')
@@ -751,7 +745,7 @@ class DataViewer(QWidget):
     def set_points(self, points):
         self.points = points
         if self.points is not None:
-            self.points = as_source(points)
+            self.points = cmp_io.open_ro(points)  # TODO: see if read is better
         self.initialize_points_item()
         self.update_points()
         self.points_color_button.setVisible(True)

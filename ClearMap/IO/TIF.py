@@ -22,18 +22,18 @@ from typing import NamedTuple, Optional, List, Dict, Tuple, Any
 import numpy as np
 from tifffile import tifffile
 
-from ClearMap.IO.Source import Source as AbstractSource
-from ClearMap.IO.Source import VirtualSource as AbstractVirtualSource
+from ClearMap.IO import Source as source_module
 import ClearMap.IO.Slice as cmp_clicing
 
 from ClearMap.Utils.Lazy import lazyattr
+from ClearMap.Utils.exceptions import ClearMapValueError, ClearMapPermissionError
 
 
 ###############################################################################
 # ## Source class
 ###############################################################################
 
-class Source(AbstractSource):
+class Source(source_module.Source):
     """Class to handle a tif file source
 
     Note
@@ -42,7 +42,8 @@ class Source(AbstractSource):
 
     .. warning:: It is also assumed that the last 3 dimensions are the image dimensions in the order z,y,x.
     """
-    def __init__(self, location, series=0, multi_file=False):
+    def __init__(self, location, series=0, multi_file=False, mode=None):
+        super().__init__(name=None, mode=mode)  # skip AbstractSource
         try:
             self._tif = tifffile.TiffFile(location, multifile=multi_file)
         except TypeError:  # TODO: filter with message
@@ -51,11 +52,7 @@ class Source(AbstractSource):
         self._series = series
         self.multi_file = multi_file
         if not self.series_mode and not self.pages_mode:
-            raise ValueError(f'Unknown metadata type {self._metadata_type}')
-
-    @property
-    def name(self):
-        return "Tif-Source"
+            raise ClearMapValueError(f'Unknown metadata type {self._metadata_type}')
 
     @lazyattr
     def series(self):
@@ -169,6 +166,9 @@ class Source(AbstractSource):
             return array[slicing]
 
     def __setitem__(self, *args):
+        if not self.is_writable:
+            raise ClearMapPermissionError('Tif Source was open RO. '
+                                          'Please reopen RW (r+ or w+) to write to disk')
         memmap = self.as_memmap()
         memmap.__setitem__(*args)
 
@@ -317,25 +317,16 @@ class Source(AbstractSource):
         return f'{name}{shape}{dtype}{order}{location}'
 
 
-class VirtualSource(AbstractVirtualSource):
-    def __init__(self, source=None, shape=None, dtype=None, order=None, location=None, name=None):
-        super(VirtualSource, self).__init__(source=source, shape=shape, dtype=dtype, order=order, location=location, name=name)
+class VirtualSource(source_module.VirtualSource):
+    def __init__(self, source=None, shape=None, dtype=None,
+                 order=None, location=None, name=None, mode=None):
+        super().__init__(source=source, shape=shape, dtype=dtype, order=order, location=location, name=name, mode=mode)
         if isinstance(source, Source):
             self.multi_file = source.multi_file
             self.series = source._series
 
-    @property
-    def name(self):
-        return 'Virtual-Tif-Source'
-
-    def as_virtual(self):
-        return self
-
     def as_real(self):
         return Source(location=self.location, series=self.series, multi_file=self.multi_file)
-
-    def as_buffer(self):
-        return self.as_real().as_buffer()
 
 
 ###############################################################################
@@ -628,14 +619,33 @@ class OMEMetadataParser(BaseMetadataParser):
 
     def parse_tile_configuration(self, *, filename_order='YX'):  #  FIXME: pass arg
         """
-        Build a dict[channel][(ix,iy)] = {
-            'filename': <basename>,
-            'stage_x': float, 'stage_y': float,
-            'relative_x': float, 'relative_y': float
-        }
+        Build a tile configuration dictionary.
 
-        - (ix,iy) are taken from the filename 'YY x XX' pattern; if absent, from FilenameAxesMap.
-        - relative_* are normalized so that min(stage) per axis is 0 across all tiles.
+        Constructs a nested dictionary mapping channels and tile coordinates to tile
+        metadata including filenames and stage/relative positions.
+
+        Parameters
+        ----------
+        filename_order : str, optional
+            Order of axes in filename pattern (default: 'YX').
+
+        Returns
+        -------
+        dict
+            Nested dict with structure: {channel: {(ix, iy): {...}}}
+            where each tile dict contains:
+
+            - 'filename' : str
+                Tile filename basename.
+            - 'stage_x', 'stage_y' : float
+                Stage coordinates.
+            - 'relative_x', 'relative_y' : float
+                Normalized coordinates (min per axis = 0 across all tiles).
+
+        Notes
+        -----
+        Tile coordinates (ix, iy) are extracted from the filename 'YY x XX' pattern,
+        or from FilenameAxesMap if the pattern is absent.
         """
 
         # Parse OME xml

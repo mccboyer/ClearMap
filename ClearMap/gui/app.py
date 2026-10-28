@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import getpass
+
 from packaging.version import Version
 
 from ClearMap.config.change_detection import (channels_added_or_removed, channel_data_type_changed,
@@ -308,7 +310,11 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
         Set the font sizes of the widgets based on *target_font_size*. All fonts will
         be shifted based on that size. This should preserve the size relationships of the fonts
         in the program. It is assumed that the program uses 4 font sizes:
-            - small, regular, big and huge
+        - small
+        - regular
+        - big
+        - and huge
+
         This will shift font sizes so that the supplied size corresponds to the new regular size.
 
         Parameters
@@ -984,10 +990,10 @@ class ClearMapApp(ClearMapAppBase):
         self.error_logger.set_file(src_folder / 'errors.html')
         self.progress_logger.set_file(src_folder / 'progress.log')
 
-    def reset_loggers(self):# FIXME: redirect should be f(log_level)
-        self.logger = Printer(redirects=None if DEBUG else 'stdout')
+    def reset_loggers(self):
+        self.logger = Printer(redirects='stdout')
         self.logger.text_updated.connect(self.textBrowser.append)
-        self.error_logger = Printer(color='red', logger_type='error', redirects=None if DEBUG else 'stderr')
+        self.error_logger = Printer(color='red', logger_type='error', redirects='stderr')
         self.error_logger.text_updated.connect(self.textBrowser.append)
         if DEBUG:
             self.patch_warnings_color()
@@ -1255,6 +1261,7 @@ class ClearMapApp(ClearMapAppBase):
     def load_sample(self) -> bool:
         """
         Load the sample configuration.
+
         If the sample path does not exist, prompt the user to clone an existing config,
         load a default config, or cancel.
         If the sample path exists, ensure a sample ID is set.
@@ -1263,10 +1270,9 @@ class ClearMapApp(ClearMapAppBase):
         Returns
         -------
         bool
-           True  -> existing experiment, caller must call boot_open()
-           False -> either:
-                      - new experiment already bootstrapped & opened, or
-                      - user canceled (src_folder is cleared)
+            - True: Existing experiment; caller must call boot_open().
+            - False: Either new experiment already bootstrapped & opened, or user canceled
+              (src_folder is cleared).
         """
         if not self.experiment_controller.sample_path_exists():
             match ClearMap.gui.dialog_helpers.option_dialog('New experiment', 'This seems to be a new experiment. Do you want to: ',
@@ -1626,7 +1632,7 @@ def _make_bootstrap_dir() -> Path:
     until the experiment folder is set by the user.
     We prefer a user-configured temp if available (CLEARMAP_TMP env var)
     otherwise use the system temp folder.
-    The folder is named "clearmap_bootstrap/session_<pid>" to avoid clashes
+    The folder is named "clearmap_bootstrap-<username>/session_<pid>" to avoid clashes
     if multiple instances are running.
     The folder is removed on exit if it stayed unused (i.e. still a bootstrap dir).
     Returns
@@ -1634,8 +1640,8 @@ def _make_bootstrap_dir() -> Path:
     Path
         The path to the temporary bootstrap directory
     """
-    root = Path(os.environ.get("CLEARMAP_TMP", tempfile.gettempdir()))
-    session = root / "clearmap_bootstrap" / f"session_{os.getpid()}"
+    root = Path(os.environ.get('CLEARMAP_TMP', tempfile.gettempdir()))
+    session = root / f'clearmap_bootstrap-{getpass.getuser()}' / f'session_{os.getpid()}'
     session.mkdir(parents=True, exist_ok=True)
     return session
 

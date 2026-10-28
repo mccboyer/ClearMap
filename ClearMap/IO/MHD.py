@@ -11,7 +11,7 @@ Using the function :func:`write_header_from_source` a mhd header for a numpy
 binary array can be created to enable loading the numpy file into imagej.
 """
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__ = 'GPLv3 - GNU General Pulic License v3 (see LICENSE.txt)'
+__license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2022 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
@@ -23,6 +23,7 @@ import zlib
 import ClearMap.IO.Source as src
 from ClearMap.IO import IO as clearmap_io
 from ClearMap.IO.FileUtils import file_extension, is_file
+from ClearMap.Utils.exceptions import ClearMapPermissionError
 
 
 ###############################################################################
@@ -32,7 +33,7 @@ from ClearMap.IO.FileUtils import file_extension, is_file
 class Source(src.Source):
     """Mhd/raw array source."""
 
-    def __init__(self, location, name=None):
+    def __init__(self, location, name=None, mode=None):
         """Mhd source class constructor.
 
         Arguments
@@ -40,7 +41,7 @@ class Source(src.Source):
         location : str
           The file name of the mhd source.
         """
-        super().__init__(name=name)
+        super().__init__(name=name, mode=mode)
         self._location = _header_file(location)
         self._memmap = None
         self._array = None
@@ -57,10 +58,6 @@ class Source(src.Source):
                 self._array = _array(self._location)
             except:
                 self._array = None
-
-    @property
-    def name(self):
-        return "Mhd-Source"
 
     @property
     def location(self):
@@ -196,6 +193,9 @@ class Source(src.Source):
             return _array(self.location).__getitem__(*args)
 
     def __setitem__(self, *args):
+        if not self.is_writable:
+            raise ClearMapPermissionError(f'Source {self} was opened read-only (mode="r"). '
+                                          f'Use io.edit() to open for writing.')
         if self._memmap is None:
             self._memmap = _memmap(self.location)
         self._memmap.__setitem__(*args)
@@ -275,23 +275,12 @@ class Source(src.Source):
 
 
 class VirtualSource(src.VirtualSource):
-    def __init__(self, source=None, shape=None, dtype=None, order=None, location=None, name=None):
+    _real_class = Source
+
+    def __init__(self, source=None, shape=None, dtype=None,
+                 order=None, location=None, name=None, mode=None):
         super(VirtualSource, self).__init__(source=source, shape=shape, dtype=dtype, order=order, location=location,
-                                            name=name)
-
-    @property
-    def name(self):
-        return 'Virtual-Mhd-Source'
-
-    def as_virtual(self):
-        return self
-
-    def as_real(self):
-        return Source(location=self.location)
-
-    def as_buffer(self):
-        return self.as_real().as_buffer()
-
+                                            name=name, mode=mode)
 
 ###############################################################################
 # IO Interface
@@ -835,7 +824,7 @@ def header_from_source(source=None, location=None, header=None, return_header_an
     if source is None and location is not None:
         source = location
 
-    source = clearmap_io.as_source(source)
+    source = clearmap_io.open_ro(source)
 
     if location is None and source.location is not None:
         location = source.location

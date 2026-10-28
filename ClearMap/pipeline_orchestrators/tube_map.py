@@ -1,11 +1,76 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
-TubeMap
-=======
+tube_map
+========
 
-This module contains the classes to generate annotated graphs from vasculature
-lightsheet data [Kirst2020]_.
+Vasculature binarization, graph construction, and vessel-type annotation.
+
+Two pipeline workers are defined here:
+
+:class:`BinaryVesselProcessor`
+    Converts raw fluorescence volumes into a binary vascular mask.
+    Steps (configurable order via the GUI pipeline widget):
+
+    1. **Binarize** — multi-path thresholding
+       (:mod:`~ClearMap.ImageProcessing.Experts.Vasculature`).
+    2. **Smooth** — topology-preserving binary smoothing.
+    3. **Fill** — parallel 3-D binary hole filling.
+    4. **Deep fill** — CNN-based hollow-tube filling
+       (:mod:`~ClearMap.ImageProcessing.machine_learning.vessel_filling`).
+
+    Multiple channels (e.g. all-vessels + arteries) are merged by
+    :meth:`~BinaryVesselProcessor.combine_binary`.
+    Step state is tracked by :class:`BinaryVesselProcessorSteps`.
+
+:class:`VesselGraphProcessor`
+    Converts the combined binary mask into an annotated vascular graph:
+
+    1. **Skeletonize** — topology-preserving 3-D thinning.
+    2. **Build** — raw graph from skeleton, radius measurement, artery/vein
+       expression sampling.
+    3. **Clean** — clique removal.
+    4. **Reduce** — degree-2 vertex contraction; edge geometry stored.
+    5. **Register** — atlas-space transform, radius scaling, annotation,
+       distance-to-surface labelling.
+    6. **Post-process** — iterative artery/vein hysteresis tracing.
+
+    Step state is tracked by :class:`VesselGraphProcessorSteps`.
+
+Radius units
+------------
+The graph processor handles three legacy precision levels
+(:class:`VesselGraphProcessor.RadiusLevel`):
+
+* **FULL** — spacing + per-axis µm radii (current).
+* **SCALAR_UM** — spacing + scalar µm radii (intermediate legacy).
+* **VOXELS** — voxel-space radii only (old graphs, :class:`DeprecationWarning` emitted).
+
+Typical usage
+-------------
+Both workers are accessed via
+:class:`~ClearMap.pipeline_orchestrators.experiment_controller.ExperimentController`::
+
+    binary = exp_ctrl.get_worker('vasculature', substep='binary')
+    graph  = exp_ctrl.get_worker('vasculature', substep='graph')
+
+    binary.binarize()
+    binary.postprocess('vessels')
+    binary.combine_binary()
+
+    graph.skeletonize_and_build_graph(binary_processor=binary)
+    graph.clean_graph()
+    graph.reduce_graph()
+    graph.register()
+    graph.post_process()
+
+See also
+--------
+:mod:`ClearMap.ImageProcessing.Experts.Vasculature` : Binarization algorithms.
+:mod:`ClearMap.ImageProcessing.machine_learning.vessel_filling` : CNN vessel filling.
+:mod:`ClearMap.Analysis.graphs.graph_processing` : Graph construction and reduction.
+:class:`~ClearMap.Analysis.graphs.graph_gt.Graph` : Graph data structure.
+[Kirst2020]_.
 """
 from __future__ import annotations
 
@@ -65,6 +130,7 @@ from .sample_info_management import SampleManager
 from .registration_orchestrator import RegistrationProcessor
 
 from ..Analysis.graphs.graph_processing import Percentile
+from ..Analysis.graphs.vessel_classifier import ClassificationConfig, VesselClassifier
 
 __author__ = ('Christoph Kirst <christoph.kirst.ck@gmail.com>,'
               ' Sophie Skriabine <sophie.skriabine@icm-institute.org>,'
@@ -173,7 +239,7 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
         """
         Extract a plain path from whatever a step produces.
         Asset → .path, Source → .location, Path/str → as-is.
-        Never stores a live Source or array — clearmap_io.as_source()
+        Never stores a live Source or array — clearmap_io
         reconstructs on demand.
         """
         if isinstance(output, Asset):
@@ -193,7 +259,7 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
 
         Source objects are serialisable path handles — we extract .path so
         _outputs holds only plain Paths, never live Source instances.
-        clearmap_io.as_source(path) reconstructs on demand.
+        clearmap_io reconstructs on demand.
         """
         output_path = self._extract_backing_path(output)
         self._outputs[asset] = output_path
@@ -219,7 +285,7 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
           2. On-disk asset
           3. Raw binary (fallback)
 
-        Callers reconstruct the Source with clearmap_io.as_source(result).
+        Callers reconstruct the Source with clearmap_io.
         """
         order = [s for s in self.steps if s not in self._lifecycle_steps]
 
@@ -506,7 +572,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         self.steps[channel].remove_next_steps_files(self.steps[channel].smoothed)
 
         source = self.steps[channel].get_source(BinaryVesselProcessorSteps.smoothed)
-        source = clearmap_io.as_source(source)
+        source = clearmap_io.open_ro(source)
         sink_path = self.get_path('binary', channel=channel, asset_sub_type='smoothed')
         smoothing_parameters = copy.deepcopy(vasculature.default_postprocessing_parameter['smooth'])
 
@@ -530,7 +596,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         self.steps[channel].remove_next_steps_files(self.steps[channel].filled)
 
         source = self.steps[channel].get_source(BinaryVesselProcessorSteps.filled)
-        source = clearmap_io.as_source(source)
+        source = clearmap_io.open_ro(source)
         sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
@@ -614,7 +680,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
                                     processing_parameter=block_params,
                                     processes=sanitize_n_processes(-1), verbose=True)  # TODO: n_processes in config?
         else:
-            clearmap_io.link_file(source, sink)
+            clearmap_io.link_file(source, sink, overwrite=True)
 
     def plot_vessel_filling_results(self, parent=None, channel='', arrange=False):
         from ClearMap.Visualization.Qt import Plot3d as q_p3d
@@ -944,7 +1010,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
                         break
 
             skeletonization.skeletonize(binary, sink=self.get_path('skeleton', channel=self.parent_channels),  # WARNING: prange
-                                        delete_border=True, processes=self._n_processes('skeletonize'), verbose=True)
+                                        delete_border=True, n_processes=self._n_processes('skeletonize'), verbose=True)
 
     def _measure_radii(self, binary_processor=None):  # FIXME: do on the clean graph to avoid measuring cliques ?
         coordinates = self.graph_raw.vertex_coordinates()
@@ -1329,240 +1395,73 @@ class VesselGraphProcessor(PipelineOrchestrator):
         graph = self.__get_graph(graph_step)
         return GraphFilter(graph, filter_type, property_name, value)
 
-    # POST PROCESS
-    @requires_graph('annotated')
-    def _pre_filter_veins(self, vein_intensity_range_on_arteries_channel: tuple[float, float], min_vein_radius_um: float):
+    def _collect_signals(self) -> 'VesselSignals':
         """
-        Filter veins based on radius and intensity in arteries channel
+        Gather all per-edge signal arrays ("artery_binary", "arteriness"...)
+        needed by the classifier.
 
-        Parameters
-        ----------
-        vein_intensity_range_on_arteries_channel : (tuple)
-            Above max (second val) on artery channel, this is an artery
-        min_vein_radius: (int)
-
-        Returns
-        -------
-
+        Handles the legacy radius level fallback: if the graph predates
+        physical-unit radii, voxel radii are used instead and a
+        DeprecationWarning is emitted.
         """
-        is_in_vein_range = is_in_range(self.graph_annotated.edge_property('artery_raw'),
-                                       vein_intensity_range_on_arteries_channel)
+        from ClearMap.Analysis.graphs.vessel_classifier import VesselSignals
 
         level = self._graph_radius_level(self.graph_annotated)
-        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
+        if level != self.RadiusLevel.VOXELS:
             radii = self.graph_annotated.edge_radii_um()
-            threshold = min_vein_radius_um
         else:
-            self._legacy_warn('_pre_filter_veins')
+            self._legacy_warn('_collect_signals')
             radii = self.graph_annotated.edge_radii_voxels()
-            threshold = self._LEGACY_THRESHOLDS['restrictive_vein_radius_vx']
 
-        return np.logical_and(radii >= threshold, is_in_vein_range)
+        def _ep(name: str):
+            """Return edge property or None if absent."""
+            return (self.graph_annotated.edge_property(name)
+                    if name in self.graph_annotated.edge_properties
+                    else None)
 
-    @requires_graph('annotated')
-    def _pre_filter_arteries(self, arteries_min_noise_edges: int):
-        """
-        Remove components where too few edges are arteries
+        def _channel_props(channel: str):
+            """Return (binary, raw) edge property arrays for a channel, or (None, None)."""
+            if not channel:
+                return None, None
+            dtype = self.sample_manager.data_type(channel)
+            dtype_singular = f'{dtype[:-3]}y' if dtype.endswith('ies') else dtype[:-1]
+            return _ep(f'{dtype_singular}_binary'), _ep(f'{dtype_singular}_raw')
 
-        Parameters
-        ----------
-        arteries_min_noise_edges : (int)
-            below is capillary
+        artery_binary, artery_raw = _channel_props(self.arteries_channel)
+        vein_binary, vein_raw = _channel_props(self.veins_channel)
 
-        Returns
-        -------
-
-        """
-        artery = self.graph_annotated.edge_property('artery_binary')
-
-        artery_graph = self.graph_annotated.sub_graph(edge_filter=artery, view=True)
-        artery_graph_edge, edge_map = artery_graph.edge_graph(return_edge_map=True)
-        artery_components, artery_size = artery_graph_edge.label_components(return_vertex_counts=True)
-        too_small = edge_map[np.in1d(artery_components, np.where(artery_size < arteries_min_noise_edges)[0])]
-        artery[too_small] = False
-        return artery
-
-    @requires_graph('annotated')
-    def _post_filter_veins(self, restrictive_veins, min_vein_radius_um: float | int):
-        artery = self.graph_annotated.edge_property('artery')
-
-        level = self._graph_radius_level(self.graph_annotated)
-        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
-            radii = self.graph_annotated.edge_radii_um()
-            threshold = min_vein_radius_um
-        else:
-            self._legacy_warn('_post_filter_veins')
-            radii = self.graph_annotated.edge_radii_voxels()
-            threshold = self._LEGACY_THRESHOLDS['permissive_vein_radius_vx']
-
-        large_vessels = radii >= threshold
-        permissive_veins = np.logical_and(np.logical_or(restrictive_veins, large_vessels), np.logical_not(artery))
-        return permissive_veins
-
-    # TRACING
-    @requires_graph('annotated')
-    def _trace_arteries(self, veins, max_tracing_iterations: int = 5):
-        """
-        Trace arteries by hysteresis thresholding
-        Keeps small arteries that are too weakly immuno-positive but still too big to be capillaries
-        stop at surface, vein or low artery expression
-
-        Parameters
-        ----------
-        veins
-        """
-        artery = self.graph_annotated.edge_property('artery')
-
-        level = self._graph_radius_level(self.graph_annotated)
-        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
-            radii = self.graph_annotated.edge_radii_um()
-            trace_radius = self.config['vessel_type_postprocessing']['tracing']['artery_trace_radius_um']
-        else:
-            self._legacy_warn('_trace_arteries')
-            radii = self.graph_annotated.edge_radii_voxels()
-            trace_radius = self._LEGACY_THRESHOLDS['artery_trace_radius_vx']
-
-        condition_args = {
-            'distance_to_surface': self.graph_annotated.edge_property('distance_to_surface'),
-            'distance_threshold': self.config['vessel_type_postprocessing']['tracing']['distance_to_surface_min'],
-            'vein': veins,
-            'radii': radii,
-            'artery_trace_radius': trace_radius,
-            'artery_intensity': self.graph_annotated.edge_property('artery_raw'),
-            'artery_intensity_min': self.config['vessel_type_postprocessing']['tracing']['artery_intensity_min']
-        }
-
-        def continue_edge(graph, edge, **kwargs):
-            if kwargs['distance_to_surface'][edge] < kwargs['distance_threshold'] or kwargs['vein'][edge]:
-                return False
-            else:
-                return (kwargs['radii'][edge] >= kwargs['artery_trace_radius'] and
-                        kwargs['artery_intensity'][edge] >= kwargs['artery_intensity_min'])
-
-        artery_traced = graph_processing.trace_edge_label(self.graph_annotated, artery,
-                                                          condition=continue_edge,
-                                                          max_iterations=max_tracing_iterations,
-                                                          **condition_args)
-
-        self.graph_annotated.define_edge_property('artery', artery_traced)
-
-    @requires_graph('annotated')
-    def _trace_veins(self, max_tracing_iterations: int = 5):
-        """
-        Trace veins by hysteresis thresholding - stop before arteries
-        """
-        min_distance_to_artery = 1
-        artery = self.graph_annotated.edge_property('artery')
-        artery_expanded = self.graph_annotated.edge_dilate_binary(artery, steps=min_distance_to_artery)
-
-        trace_cfg = self.config['vessel_type_postprocessing']['tracing']
-        pre_filt_cfg = self.config['vessel_type_postprocessing']['pre_filtering']
-
-        level = self._graph_radius_level(self.graph_annotated)
-        if level != VesselGraphProcessor.RadiusLevel.VOXELS:
-            radii = self.graph_annotated.edge_radii_um()
-            trace_radius = trace_cfg['vein_trace_radius_um']
-        else:
-            self._legacy_warn('_trace_veins')
-            radii = self.graph_annotated.edge_radii_voxels()
-            trace_radius = self._LEGACY_THRESHOLDS['vein_trace_radius_vx']
-
-        artery_intensity = self.graph_annotated.edge_property('artery_raw') if self.use_arteries_for_graph else None
-        vein_intensity = self.graph_annotated.edge_property('vein_raw') if self.veins_channel else None
-
-        condition_args = {
-            'artery_expanded': artery_expanded,
-            'radii': radii,
-            'artery_intensity': artery_intensity,
-            'vein_trace_radius': trace_radius,
-            'vein_intensity': vein_intensity,
-            'vein_intensity_range': tuple(pre_filt_cfg['vein_intensity_range_on_arteries_ch']),
-            'vein_intensity_min': trace_cfg['vein_intensity_min']
-        }
-
-        def continue_edge(graph, edge, **kwargs):
-            if kwargs['artery_expanded'][edge]:  # too close to artery
-                return False
-            else:
-                radius_ok = kwargs['radii'][edge] >= kwargs['vein_trace_radius']
-                if not radius_ok:
-                    return False
-                else:
-                    # If we have vein signal: must be positive
-                    if kwargs['vein_intensity'] is not None:
-                        if kwargs['vein_intensity'][edge] < kwargs['vein_intensity_min']:
-                            return False
-                    # If we have artery signal: must be low
-                    if kwargs['artery_intensity'] is not None:
-                        lo, hi = kwargs['vein_intensity_range_on_arteries_ch']
-                        if not (lo <= kwargs['artery_intensity'][edge] <= hi):
-                            return False
-                    return True
-
-        vein_traced = graph_processing.trace_edge_label(
-            self.graph_annotated, self.graph_annotated.edge_property('vein'),
-            condition=continue_edge, max_iterations=max_tracing_iterations,
-            **condition_args)
-
-        self.graph_annotated.define_edge_property('vein', vein_traced)
-
-    @requires_graph('annotated')
-    def _remove_small_vessel_components(self, vessel_name, min_vessel_size: int = 30):
-        """
-        Filter out small components that will become capillaries
-        """
-        vessel = self.graph_annotated.edge_property(vessel_name)
-        graph_vessel = self.graph_annotated.sub_graph(edge_filter=vessel, view=True)
-        graph_vessel_edge, edge_map = graph_vessel.edge_graph(return_edge_map=True)
-
-        vessel_components, vessel_size = graph_vessel_edge.label_components(return_vertex_counts=True)
-        remove = edge_map[np.in1d(vessel_components, np.where(vessel_size < min_vessel_size)[0])]
-        vessel[remove] = False
-
-        self.graph_annotated.define_edge_property(vessel_name, vessel)
+        return VesselSignals(radii=radii,
+                             artery_binary=artery_binary, artery_intensity=artery_raw,
+                             vein_binary=vein_binary, vein_intensity=vein_raw,
+                             distance_to_surface=_ep('distance_to_surface'))
 
     @requires_graph('annotated')
     def post_process(self):  # TODO: progress
         """
-        Iteratively refine arteries and veins based on one another
+        Iteratively refine arteries and veins based on one another.
 
-        Returns
-        -------
-
+        Delegates to :class:`~ClearMap.Analysis.graphs.vessel_classifier.VesselClassifier`
+        which encapsulates the full iterative classification algorithm.
         """
-        if self.use_arteries_for_graph:
-            cfg = self.config['vessel_type_postprocessing']
+        if not self.use_arteries_for_graph:
+            return
 
-            artery = self._pre_filter_arteries(cfg['pre_filtering']['arteries_min_noise_edges'])
+        level = self._graph_radius_level(self.graph_annotated)
+        use_legacy = level == self.RadiusLevel.VOXELS
 
-            # Definitely a vein because too big
-            restrictive_veins = self._pre_filter_veins(
-                cfg['pre_filtering']['vein_intensity_range_on_arteries_ch'],
-                min_vein_radius_um=cfg['pre_filtering']['restrictive_vein_radius_um'])
-            artery[restrictive_veins] = False
+        if use_legacy:
+            self._legacy_warn('post_process')
 
-            self.graph_annotated.define_edge_property('artery', artery)
+        cfg = ClassificationConfig.from_config(self.config['vessel_type_postprocessing'],
+                                               legacy_thresholds=self._LEGACY_THRESHOLDS, use_legacy=use_legacy)
 
-            # Not huge vein but not an artery so still a vein (with temporary radius for artery tracing)
-            tmp_veins = self._post_filter_veins(restrictive_veins,
-                                                min_vein_radius_um=cfg['pre_filtering']['permissive_vein_radius_um'])
-            self._trace_arteries(tmp_veins, max_tracing_iterations=cfg['tracing']['max_arteries_iterations'])
+        signals = self._collect_signals()
 
-            # The real vein size filtering
-            vein = self._post_filter_veins(restrictive_veins,
-                                           min_vein_radius_um=cfg['pre_filtering']['final_vein_radius_um'])
-            self.graph_annotated.define_edge_property('vein', vein)
+        classifier = VesselClassifier(self.graph_annotated, cfg, signals)
+        classifier.classify()
 
-            self._trace_veins(max_tracing_iterations=cfg['tracing']['max_veins_iterations'])
-
-            #  Clean up fragments (veins or arteries) that tracing extended but not enough to be biologically meaningful.
-            self._remove_small_vessel_components('artery',
-                                                 min_vessel_size=cfg['capillaries_removal']['min_artery_component_edges'])
-            self._remove_small_vessel_components('vein',
-                                                 min_vessel_size=cfg['capillaries_removal']['min_vein_component_edges'])
-
-            self.graph_annotated.save(self.get_path('graph', channel=self.parent_channels))
-            self.graph_traced = self.graph_annotated
+        self.graph_annotated.save(self.get_path('graph', channel=self.parent_channels))
+        self.graph_traced = self.graph_annotated
 
     def __get_branch_voxelization_params(self):
         voxelize_branch_parameter = {

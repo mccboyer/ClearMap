@@ -7,7 +7,7 @@ EXTENSIONS = {
     'layout': ['.lyt'],
     'elastix_image': ['.mhd'],
     'elastix_points': ['.pts'],
-    'table': ['.npy', '.feather', '.csv'],
+    'table': ['.feather', '.csv', '.npy'],
     'log': ['.log'],
     'error_log': ['.html'],
 }
@@ -133,7 +133,12 @@ CHANNELS_ASSETS_TYPES_CONFIG = {
         'file_format_category': 'table',
         'resource_type': 'results',
         'relevant_pipelines': ['CellMap'],  # TODO: tune relevance for subsets
-        'sub_types': ['raw', 'filtered', 'shape', 'bkg']
+        'sub_types': {
+            'raw': None,                                   # inherits table
+            'filtered': None,                              # inherits table
+            'shape': {'file_format_category': 'image'},    # image → array
+            'bkg': {'file_format_category': 'image'},      # image → array
+        }
     },
     'vertices': {
         'file_format_category': 'table',
@@ -145,7 +150,11 @@ CHANNELS_ASSETS_TYPES_CONFIG = {
         'file_format_category': 'table',
         'resource_type': 'results',
         'relevant_pipelines': ['TractMap'],
-        'sub_types': ['raw', 'filtered', 'shape']
+        'sub_types': {
+            'raw': None,
+            'filtered': None,
+            'shape': {'file_format_category': 'image'},
+        }
     },
     'cells_stats': {
         'file_format_category': 'table',

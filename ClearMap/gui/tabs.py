@@ -4,32 +4,40 @@ tabs
 
 GUI tabs for ClearMap.
 
-All the classes in this module are subclasses (direct or indirect) of the `ExperimentTab` and
- 'GroupTab` classes which derive from `GenericTab` and provide the basic structure and methods that are common to all tabs.
+All the classes in this module are subclasses (direct or indirect) of the
+``ExperimentTab`` and ``GroupTab`` classes which derive from ``GenericTab``
+and provide the basic structure and methods that are common to all tabs.
 
 Presentation
 ------------
-Each **tab** manages a specific part of the processing pipeline and has its own UI elements.
-It is composed of:
+
+Each **tab** manages a specific part of the processing pipeline and has its
+own UI elements. It is composed of:
+
 - `ui`: QWidget constructed from a `.ui` file that defines the layout and the widgets.
 - `sample_manager`: handles the sample metadata and workspace.
 - `sample_params`: experiment-level object that links the UI to the sample configuration file.
 - `params`: tab specific parameter link object (UI - config).
-(For the `SampleInfoTab`, this is the `SampleParameters` object.)
+  (For the `SampleInfoTab`, this is the `SampleParameters` object.)
 - `name`: used to identify the tab in the GUI.
 - `processing_type`: identifies the type of tab, one of (None, 'pre', 'post', 'batch').
 
-Abstract tabs Hierarchy
+Abstract tabs hierarchy
 -----------------------
-- **GenericTab**: base class for all tabs, handles the UI and channel pages.
-- **ExperimentTab**: base for tabs tied to a single experiment (SampleInfo, Stitching, Registration, CellMap, TractMap, Colocalization).
-- **PipelineTab**: base for Pre/Post-processing tabs.
-- **PreProcessingTab / PostProcessingTab**: Specialisation of PipelineTab that form the basis for concrete tabs.
-- **GroupTab**: base for group/multi-experiment tabs.
-- **BatchTab**: Abstract tab for batch/group workflows (e.g., batch processing, group analysis).
 
-Optionally, for `Pipeline` tabs (`PreProcessingTab` and `PostProcessingTab`),
-a `worker` object is used to handle the processing steps and computation.
+- **GenericTab**: base class for all tabs, handles the UI and channel pages.
+- **ExperimentTab**: base for tabs tied to a single experiment
+  (SampleInfo, Stitching, Registration, CellMap, TractMap, Colocalization).
+- **PipelineTab**: base for Pre/Post-processing tabs.
+- **PreProcessingTab** / **PostProcessingTab**: specialisation of
+  PipelineTab that form the basis for concrete tabs.
+- **GroupTab**: base for group/multi-experiment tabs.
+- **BatchTab**: abstract tab for batch/group workflows (e.g. batch
+  processing, group analysis).
+
+Optionally, for ``Pipeline`` tabs (``PreProcessingTab`` and
+``PostProcessingTab``), a ``worker`` object is used to handle the
+processing steps and computation.
 
 Tab setup flow
 --------------
@@ -39,38 +47,43 @@ Setup order
 
 Typical calling sequence is:
 
-- `tab.setup`
-- `tab.set_params`
-    - sets sample_params if not SampleInfoTab
-    - calls `tab._set_params`
-    - calls `tab._setup_workers` (for pipeline tabs)
-    - calls `tab._create_channels`  (if the tab has channel pages)
-    - calls `tab._load_config_to_gui` (via params)
-    - calls `tab._bind_params_signals`  (for tab specific signals)
+- ``tab.setup``
+- ``tab.set_params``
+
+  - sets ``sample_params`` if not ``SampleInfoTab``
+  - calls ``tab._set_params``
+  - calls ``tab._setup_workers`` (for pipeline tabs)
+  - calls ``tab._create_channels`` (if the tab has channel pages)
+  - calls ``tab._load_config_to_gui`` (via params)
+  - calls ``tab._bind_params_signals`` (for tab-specific signals)
 
 Tabs with channels
 ******************
 
-Some tabs can have channel pages.
-Channel pages are created by `add_channel_tab()` (invoked from `set_params()` and, for tabs that allow it, the (+) button).
-To control the behavior of this method, the following methods can be implemented in the concrete tab classes:
+Some tabs can have channel pages.  Channel pages are created by
+``add_channel_tab()`` (invoked from ``set_params()`` and, for tabs that
+allow it, the ``(+)`` button).  To control the behaviour of this method,
+the following methods can be implemented in the concrete tab classes:
 
-- `_setup_channel(page_widget, channel)` (optional): Additional setup for the ui (before binding).
-- `_bind_channel` (**required**: wire channel page specific actions which are not automatically
-set through the params object attribute).
+- ``_setup_channel(page_widget, channel)`` (optional): additional setup
+  for the UI (before binding).
+- ``_bind_channel`` (**required**): wire channel-page-specific actions
+  which are not automatically set through the params object attribute.
 
-`PipelineTab` additional setup methods
-**************************************
+PipelineTab additional setup methods
+************************************
 
-- `_setup_workers`: Sets up the worker (Processor) which handles the computations associated with this tab.
-Called in `set_params` and also when the sample config is applied.
+- ``_setup_workers``: sets up the worker (Processor) which handles the
+  computations associated with this tab. Called in ``set_params`` and
+  also when the sample config is applied.
 
 Processing steps
 ----------------
 
-Pre/Post processing tabs expose worker orchestration methods.
-UI widgets are wired via ParamLinks (and bus events), while buttons typically call small
-wrappers that run steps in threads and update progress dialogs.
+Pre/Post processing tabs expose worker orchestration methods.  UI widgets
+are wired via ParamLinks (and bus events), while buttons typically call
+small wrappers that run steps in threads and update progress dialogs.
+
 ====================
 """
 from __future__ import annotations
@@ -117,7 +130,7 @@ from ClearMap.Visualization.Qt.utils import link_dataviewers_cursors
 from ClearMap.Visualization.Qt import Plot3d as plot_3d
 
 from ClearMap.Utils.exceptions import (ClearMapVRamException, GroupStatsError, MissingRequirementException,
-                                       ClearMapWorkspaceError)
+                                       ClearMapWorkspaceError, ClearMapValueError)
 from ClearMap.Utils.events import (ChannelsChanged, UiPrepareRawDataForClearMap, UiRequestPlotMiniBrain,
                                    UiRequestPlotAtlas, UiOrientationChanged, UiCropChanged, ChannelDefaultsChanged,
                                    UiRequestLandmarksDialog, UiAlignWithChanged, UiVesselGraphFiltersChanged,
@@ -799,9 +812,11 @@ class RegistrationTab(PreProcessingTab['RegistrationProcessor']):
         self.__update_channel_combo_boxes(channel)
 
     def __update_channel_combo_boxes(self, channel: str, page_widget: QWidget | None = None) -> None:
-        """Update lsit of possible channels in combo boxes"""
+        """Update list of possible channels in combo boxes"""
         if page_widget is None:
             page_widget = self.ui.channelsParamsTabWidget.get_channel_widget(channel)
+        if page_widget is None:
+            raise ClearMapValueError(f'page_widget cannot be None for {channel=}')
         other_channels = list(set(self.worker.channels_to_register()) - {channel})
         populate_combobox(page_widget.alignWithComboBox, [None, 'atlas'] + other_channels)
         populate_combobox(page_widget.movingChannelComboBox,
@@ -947,6 +962,7 @@ class RegistrationTab(PreProcessingTab['RegistrationProcessor']):
                         return
                 try:
                     self.wrap_step(f'Resampling {channel} for registration', self.worker.resample_channel,
+                                   bypass_exceptions=[FileExistsError], # FIXME: ResampledFileExistsError with recovery ??
                                    step_kw_args={'channel': channel, 'increment_main': (i != 0)})
                 except FileExistsError:  # REFACTOR: factorise with the above
                     option_idx = option_dialog('Files exist',
@@ -1127,7 +1143,7 @@ class CellCounterTab(PostProcessingTab["CellDetector"]):
         if self.sample_manager.get('cells', channel=channel, postfix='filtered').exists:
             worker = self.get_worker(channel)
             self.wrap_step('Voxelization', worker.voxelize,
-                           step_kw_args={'weights_column': self.params.voxelization_weights},
+                           step_kw_args={'weights_column': self.params[channel].voxelization_weights},
                            abort_func=worker.stop_process, nested=False)
         else:
             self.main_window.popup('Could not run voxelization, missing filtered cells table. '
@@ -1212,6 +1228,8 @@ class CellCounterTab(PostProcessingTab["CellDetector"]):
     def post_process_cells(self, channel: str) -> None:  # WARNING: some plots in .post_process_cells() without UI params
         worker = self.get_worker(channel)
         self.wrap_step('Post processing cells', worker.post_process_cells, abort_func=worker.stop_process)
+        if worker.stopped:  # TODO: check if we need a warning popup
+            return
         self.update_cell_number(channel)
 
     def update_cell_number(self, channel: str) -> None:
@@ -1265,7 +1283,11 @@ class CellCounterTab(PostProcessingTab["CellDetector"]):
     def filter_cells(self, channel: str) -> None:
         self.__filter_cells(channel, is_last_step=False)
         detector = self.get_worker(channel)
+        if detector.stopped:
+            return
         self.wrap_step('Aligning', detector.atlas_align, abort_func=detector.stop_process, save_cfg=False)
+        if detector.stopped:
+            return
         detector.export_collapsed_stats()
 
     def run_cell_map(self) -> None:
@@ -1276,13 +1298,20 @@ class CellCounterTab(PostProcessingTab["CellDetector"]):
     def run_channel(self, channel: str) -> None:
         """Run the whole pipeline at once for a single channel"""
         self.update_cell_number(channel)
+        detector = self.get_worker(channel)
         params = self.params[channel]
         if params.detect_cells:
             self.detect_cells(channel)
+            if detector.stopped:
+                return
         if params.filter_cells:
             self.post_process_cells(channel)
+            if detector.stopped:
+                return
         if params.voxelize:
             self.voxelize(channel)
+            if detector.stopped:
+                return
         if params.plot_when_finished:
             self.plot_cell_map_results(channel)
 

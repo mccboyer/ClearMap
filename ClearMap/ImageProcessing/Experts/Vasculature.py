@@ -9,7 +9,7 @@ This module provides the basic routines for processing vasculature data.
 The routines are used in the :mod:`ClearMap.Scripts.TubeMap` pipeline.
 """
 __author__ = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__ = 'GPLv3 - GNU General Pulic License v3 (see LICENSE.txt)'
+__license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
@@ -502,7 +502,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     # initialize binary status for inspection
     binary_status = parameter.get('binary_status')
     if binary_status:
-        binary_status = io.as_source(binary_status)
+        binary_status = io.open_ro(binary_status)
         binary_status = binary_status[base_slicing]
 
     default_step_params = {'parameter': parameter, 'steps_to_measure': {}, 'prefix': prefix,
@@ -520,7 +520,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         not_low = np.logical_not(low)
 
         if save:
-            save = io.as_source(save)
+            save = io.initialize(save)  # edit or create
             save[base_slicing] = clipped[valid_slicing]
 
         if binary_status is not None:
@@ -564,7 +564,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         del binarized
 
         if save:
-            save = io.as_source(save)
+            save = io.initialize(save)  # edit or create
             save[base_slicing] = deconvolved[valid_slicing]
 
         if verbose:
@@ -618,7 +618,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         equalized = equalize(median, mask=mask, **parameter_equalize)
 
         if save:
-            save = io.as_source(save)
+            save = io.initialize(save)  # edit or create
             save[base_slicing] = equalized[valid_slicing]
 
         if verbose:
@@ -665,7 +665,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             del background
 
             if save:
-                save = io.as_source(save)
+                save = io.initialize(save)  # edit or create
                 save[base_slicing] = tubeness[valid_slicing]
         else:
             tubeness = equalized
@@ -675,7 +675,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
         save = parameter_vesselization.get('save')
         if save:
-            save = io.as_source(save)
+            save = io.initialize(save)  #  edit or create
             save[base_slicing] = tubeness[valid_slicing]
 
         if verbose:
@@ -792,7 +792,7 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         warnings.warn('No postprocessing steps defined, skipping postprocessing.')
         return
 
-    source = io.as_source(source)
+    source = io.open_ro(source)
     sink = ap.initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
     if verbose:
@@ -886,7 +886,7 @@ def threshold_isodata(source):
 
 def threshold_adaptive(source, function=threshold_isodata, selem=(100, 100, 3), spacing=(25, 25, 3),
                        interpolate=1, mask=None, step=None):
-    source = io.as_source(source)[:]
+    source = io.read(source)[:]
     threshold = ls.apply_local_function(source, function=function, mask=mask, dtype=float,
                                         selem=selem, spacing=spacing, interpolate=interpolate, step=step)
     return threshold
@@ -952,7 +952,7 @@ def binary_statistics(source):
     statistics : dict
        A dict with entires {description : count}.
     """
-    status, counts = np.unique(io.as_source(source)[:], return_counts=True)
+    status, counts = np.unique(io.read(source)[:], return_counts=True)
     return {status_to_description(s): c for s, c in zip(status, counts)}
 
 

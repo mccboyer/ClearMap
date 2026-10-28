@@ -9,7 +9,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from contextlib import contextmanager
-from typing import final, Callable, Any, TYPE_CHECKING, TypeVar, Generic, ParamSpec
+from typing import final, Callable, Any, TYPE_CHECKING, TypeVar, Generic, ParamSpec, Tuple
 
 import numpy as np
 from PyQt5.QtWidgets import QWhatsThis, QWidget, QApplication
@@ -515,6 +515,7 @@ class GenericTab(GenericUi, BusSubscriberMixin):
     def wrap_step(self, task_name: str, func: Callable, step_args: list[Any] | None = None,
                   step_kw_args: dict[str, Any] | None = None, n_steps: int = 1,
                   abort_func: Callable | None = None,
+                  bypass_exceptions: Tuple[Exception] | None = None,
                   save_cfg: bool = True, nested: bool = True, close_when_done: bool = True,
                   main_thread: bool = False) -> None:
         """
@@ -535,6 +536,9 @@ class GenericTab(GenericUi, BusSubscriberMixin):
             The number of top level steps in the computation. This will be disabled if nested is False.
         abort_func : Callable | None
             The function to trigger to abort the execution of the computation (bound to the abort button)
+        bypass_exceptions: Tuple[Exception] | None
+            A tuple of exception types to bypass the GUI exception handling for.
+            Defaults to empty.
         save_cfg : bool
             Whether to save the configuration to disk before running the computation.
             This is usually the right choice to ensure that the config reloaded by func is up to date.
@@ -559,6 +563,8 @@ class GenericTab(GenericUi, BusSubscriberMixin):
             else:
                 self.main_window.wrap_in_thread(func, *step_args, **step_kw_args)
         except Exception as err:
+            if bypass_exceptions and isinstance(err, tuple(bypass_exceptions)):
+                raise err  # Leave to caller
             if not getattr(err, '_gui_handled', False):
                 func_name = getattr(func, '__name__', str(func))
                 action = handle_exception(err, parent=self.main_window, context=f'{self.name} → {func_name}')
@@ -628,14 +634,30 @@ class GenericTab(GenericUi, BusSubscriberMixin):
         Decorator for tab methods that produce plot widgets.
 
         Handles:
-        - status message display
-        - clearing previous plots
-        - MissingRequirementException / PlotGraphError
-        - (dvs, titles) tuple return pattern
-        - setup_plots() call
-        - filtering return to DataViewer instances only
 
-        Usage:
+        - Status message display.
+        - Clearing previous plots.
+        - ``MissingRequirementException`` / ``PlotGraphError``.
+        - ``(dvs, titles)`` tuple return pattern.
+        - ``setup_plots()`` call.
+        - Filtering return to ``DataViewer`` instances only.
+
+        Parameters
+        ----------
+        status_msg : str, optional
+            Status message to display during plotting (default: ``''``).
+
+        Returns
+        -------
+        Callable
+            Decorated function that wraps plot logic with error handling
+            and setup.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
             @GenericTab.ui_plot("Plotting p-values…")
             def plot_p_vals(self, ...):
                 # pure plotting logic
@@ -977,10 +999,10 @@ class PostProcessingTab(PipelineTab[TWorker]):
         self.main_window.clear_plots()
         no_scale = False
         if isinstance(channel, (list, tuple)):
-            sources = [self.sample_manager.get('resampled', channel=ch).as_source() for ch in channel]
+            sources = [self.sample_manager.get('resampled', channel=ch).open_ro() for ch in channel]
             if not np.all([src.shape == sources[0].shape for src in sources]):
                 raise ValueError('Channels have different shapes')
-            plot_image = np.mean([self.sample_manager.get('resampled', channel=ch).as_source() for ch in channel], axis=0)
+            plot_image = np.mean([self.sample_manager.get('resampled', channel=ch).read() for ch in channel], axis=0)
             channel = channel[0]
         else:
             # asset = self.sample_manager.get('stitched', channel=channel)
@@ -989,7 +1011,7 @@ class PostProcessingTab(PipelineTab[TWorker]):
             # else:  # missing stitched
             # FIXME: we cannot currently use stitched because we need to transpose it and it is too heavy for that
             asset = self.sample_manager.get('resampled', channel=channel)
-            plot_image = asset.as_source()
+            plot_image = asset.open_ro()
         self.main_window.ortho_viewer.setup(plot_image, params, parent=self.main_window, no_scale=no_scale)
         dvs = self.main_window.ortho_viewer.plot_orthogonal_views()
         if not no_scale:

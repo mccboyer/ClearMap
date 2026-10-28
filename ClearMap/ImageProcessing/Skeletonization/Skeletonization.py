@@ -22,7 +22,7 @@ References
 .. [Raynal2000] B. Raynal and M. Couprie, Istmus-Based 6-Directional Parallel Thinning Algorithms.
 """
 __author__    = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__   = 'GPLv3 - GNU General Pulic License v3 (see LICENSE.txt)'
+__license__   = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__   = 'http://idisco.info'
 __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
@@ -36,12 +36,16 @@ import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
 import ClearMap.ImageProcessing.Skeletonization.PK12 as PK12
 
 import ClearMap.Utils.Timer as tmr
+from ClearMap.Utils.utilities import sanitize_n_processes
+
 
 ###############################################################################
 ### Skeletonization
 ###############################################################################
 # FIXME: accept n_processes
-def skeletonize(source, sink = None, points = None, method = 'PK12i', steps = None, in_place = False, verbose = True, **kwargs):
+def skeletonize(source, sink = None, points = None,
+                method = 'PK12i', steps = None, in_place = False,
+                n_processes=None, verbose=True, **kwargs):
   """Skeletonize 3d binary arrays.
   
   Arguments
@@ -64,6 +68,7 @@ def skeletonize(source, sink = None, points = None, method = 'PK12i', steps = No
   skeleton : Source
     The skeletonized array.
   """
+  n_processes = sanitize_n_processes(n_processes)
   if verbose:
     timer = tmr.Timer()
   
@@ -75,9 +80,11 @@ def skeletonize(source, sink = None, points = None, method = 'PK12i', steps = No
       binary_buffer = np.array(binary_buffer)
   
   if method == 'PK12':
-    result = PK12.skeletonize(binary_buffer, points=points, steps=steps, verbose=verbose, **kwargs)  # prange
+    result = PK12.skeletonize(binary_buffer, points=points, steps=steps,
+                              n_processes=n_processes, verbose=verbose, **kwargs)  # prange
   elif method == 'PK12i':
-    result = PK12.skeletonize_index(binary_buffer, points=points, steps=steps, verbose=verbose, **kwargs)  # prange
+    result = PK12.skeletonize_index(binary_buffer, points=points, steps=steps,
+                                    n_processes=n_processes, verbose=verbose, **kwargs)  # prange
   else:
     raise RuntimeError(f'Skeletonizaton method {method!r} is not valid!')
                       
@@ -85,7 +92,7 @@ def skeletonize(source, sink = None, points = None, method = 'PK12i', steps = No
     timer.print_elapsed_time(head='Skeletonization')
 
   if sink is None:
-    sink = ap.io.as_source(result)
+    sink = io.initialize(result)
   elif isinstance(sink, str):
     sink = ap.write(sink, result)  # prange
   else:

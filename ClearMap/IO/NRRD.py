@@ -12,7 +12,7 @@ Note
   specifications.
 """
 __author__    = 'Christoph Kirst <christoph.kirst.ck@gmail.com>'
-__license__   = 'GPLv3 - GNU General Pulic License v3 (see LICENSE.txt)'
+__license__   = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__   = 'http://idisco.info'
 __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
@@ -25,7 +25,7 @@ import datetime
 import numpy as np
 
 import ClearMap.IO.Source as src
-from ClearMap.Utils.exceptions import NrrdError
+from ClearMap.Utils.exceptions import NrrdError, ClearMapPermissionError
 
 
 ###############################################################################
@@ -35,7 +35,7 @@ from ClearMap.Utils.exceptions import NrrdError
 class Source(src.Source):
   """Nrrd array source."""
   
-  def __init__(self, location):
+  def __init__(self, location, mode=None):
     """Nrrd source class constructor.
     
     Arguments
@@ -43,11 +43,8 @@ class Source(src.Source):
     location : str
       The file nameof the nrrd source.
     """
+    super().__init__(mode=mode)
     self._location = location
-
-  @property
-  def name(self):
-    return "Nrrd-Source"
 
   @property
   def location(self):
@@ -155,6 +152,9 @@ class Source(src.Source):
     return memmap.__getitem__(*args)
 
   def __setitem__(self, *args):
+    if not self.is_writable:
+        raise ClearMapPermissionError(f'Source {self} was opened read-only (mode="r"). '
+                                      f'Use io.edit() to open for writing.')
     memmap = _memmap(self.location)
     memmap.__setitem__(*args)
 
@@ -231,23 +231,14 @@ class Source(src.Source):
 
 
 class VirtualSource(src.VirtualSource):
-  def __init__(self, source = None, shape = None, dtype = None, order = None, location = None, name = None):
-    super(VirtualSource, self).__init__(source=source, shape=shape, dtype=dtype, order=order, location=location, name=name)
+  _real_class = Source
+
+  def __init__(self, source=None, shape=None, dtype=None,
+               order=None, location=None, name=None, mode=None):
+    super().__init__(source=source, shape=shape, dtype=dtype, order=order,
+                     location=location, name=name, mode=mode)
     if isinstance(source, Source):
       self.location = source.location
-
-  @property 
-  def name(self):
-    return 'Virtual-Nrrd-Source'
-
-  def as_virtual(self):
-    return self
-
-  def as_real(self):
-    return Source(location=self.location)
-
-  def as_buffer(self):
-    return self.as_real().as_buffer()
 
 
 ###############################################################################
