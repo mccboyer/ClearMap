@@ -11,8 +11,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from ClearMap.IO import IO as cmp_io
-from ClearMap.IO.MMP import Source as memmap_source
+from ClearMap.IO import io_ops, source_geometry
+from ClearMap.IO.source.backends.mmp_backend import MMPSource
 from ClearMap.IO.workspace2 import Workspace2
 
 from ClearMap.Utils.exceptions import MissingRequirementException
@@ -43,6 +43,7 @@ def label_points_wrapper(annotator, coords):
 
 class TractMapProcessor(ChannelPipelineOrchestrator):
 
+    pipeline = 'TractMap'
     config_name = 'tract_map'
 
     block_re = ('Processing block', re.compile(r'.*?Processing block \d+/\d+.*?\selapsed time:\s\d+:\d+:\d+\.\d+'))
@@ -67,17 +68,23 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
                              f'that matches the one in the sample_params file.')
         self.setup(sample_manager, channel, registration_processor)
 
-    def setup(self, sample_manager, channel_name, registration_processor):
+    def setup(self, sample_manager=None, channel_name=None, registration_processor=None):
+        """
+        Register the channel in the workspace once the sample is ready for it (see sample_ready).
+        Idempotent: what is not given (sample manager, channel, registration processor) is the one
+        already set, so that it can be called again without argument, e.g. by setup_if_needed.
+        """
         self.sample_manager = sample_manager if sample_manager else self.sample_manager
 
-        self.channel = channel_name
-        self.registration_processor = registration_processor
+        self.channel = channel_name if channel_name is not None else self.channel
+        self.registration_processor = registration_processor if registration_processor is not None else self.registration_processor
 
-        if self.sample_manager.setup_complete:
-            self.workspace = sample_manager.workspace
-            self.setup_complete = True
+        if self.sample_ready:
+            self.workspace = self.sample_manager.workspace
+            self.register_in_workspace()
+            self._setup_done = True
         else:
-            self.setup_complete = False
+            self._setup_done = False
             warnings.warn(f'SampleManager not set up yet. Setting TractMapProcessor up defered.')
 
     def create_test_dataset(self, slicing):
@@ -206,10 +213,6 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
         else:
             raise NotImplementedError('Output to file not implemented yet')
 
-    def get_registration_sequence_channels(self, stop_channel='atlas'):
-        return (self.registration_processor.
-                get_registration_sequence_channels(self.channel, stop_channel))
-
     @staticmethod
     def transformation(coords, source_shape, resampled_shape, results_directories):
         coords = resample_points(
@@ -267,16 +270,8 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
             # FIXME: in this case compute from scale differences
             raise ValueError(f'Resampled shape not found for channel {self.channel}')
 
-        results_directories = []
-        for channel in self.get_registration_sequence_channels(stop_channel=target_channel):
-            if self.registration_config['channels'][channel]['moving_channel'] in (None, 'intrinsically_aligned'):
-                continue
-            else:
-                result_dir = self.registration_processor.get_elx_asset('aligned', channel=channel).path.parent
-                if not result_dir.exists():
-                    raise MissingRequirementException(f'Elastix result directory {result_dir} for {channel=} not found.'
-                                                      f'Please run the registration first.')
-                results_directories.append(result_dir)
+        results_directories = self.registration_processor.get_transform_directories(self.channel,
+                                                                                    stop_channel=target_channel)
 
         debug_bcp = self.workspace.debug
         self.workspace.debug = False
@@ -330,7 +325,7 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
                                  return_buffer=False)
 
         with AnnotationManager() as manager:
-            annotator = manager.Annotation(self.registration_processor.annotators[self.channel])
+            annotator = manager.Annotation(self.registration_processor.annotator_of(self.channel))
             labeling_fn = functools.partial(label_points_wrapper, annotator)
             labeling_fn.__name__ = 'label_points'  # for block_processing prints
             perf_cfg = self.cfg_coordinator.get_config_view(self.config_name)['performance']['label']['block_processing']
@@ -349,8 +344,8 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
         for i in range(3):
             shift = self.config['test_set_slicing'][f'dim_{i}'][0]
             coordinates[:, i] += shift
-        if not isinstance(coordinates, (np.memmap, memmap_source)):
-            cmp_io.write(coords_asset.path, coordinates)
+        if not isinstance(coordinates, (np.memmap, MMPSource)):
+            io_ops.write(coords_asset.path, coordinates)
         print('TractMap coordinates shifted')
 
     def run_pipeline(self, tuning=False):
@@ -393,7 +388,7 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
             df[f'{l}t'] = decimated_coordinates_transformed[:, i]
 
         unique_ids = np.sort(np.unique(decimated_labels))
-        annotator = self.registration_processor.annotators[self.channel]
+        annotator = self.registration_processor.annotator_of(self.channel)
         color_map = {id_: annotator.find(id_, key='id')['rgb'] for id_ in unique_ids}
         color_map[0] = np.array((1, 0, 0))  # default to red
         df['color'] = df['id'].map(color_map)
@@ -408,7 +403,7 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
         self.prepare_watcher_for_substep(1, self.block_re, 'Voxelization', increment_main=True)
 
         voxelization_parameter = dict(
-            shape=cmp_io.shape(self.registration_processor.annotators[self.channel].annotation_file),
+            shape=source_geometry.shape(self.registration_processor.annotator_of(self.channel).annotation_file),
             dtype=None,
             weights=None,
             method='sphere',
@@ -500,14 +495,14 @@ class TractMapProcessor(ChannelPipelineOrchestrator):
         else:
             coordinates = df[['xt', 'yt', 'zt']].values.astype(int)  # required to match integer z
             dv.atlas = self.get('atlas', channel=self.channel, asset_sub_type='annotation').read()
-            dv.structure_names = self.registration_processor.annotators[self.channel].get_names_map()
+            dv.structure_names = self.registration_processor.annotator_of(self.channel).get_names_map()
         if 'hemisphere' in df.columns:
             hemispheres = df['hemisphere']
         else:
             hemispheres = None
 
         unique_ids = np.sort(np.unique(df['id']))
-        annotator = self.registration_processor.annotators[self.channel]
+        annotator = self.registration_processor.annotator_of(self.channel)
         # color_map = {id_: annotator.find(id_, key='id')['rgb'] for id_ in unique_ids}
         color_map = {id_: annotator.convert_label(id_, key='id', value='color_hex_triplet') for id_ in unique_ids}
         color_map[0] = np.array(to_hex((1, 0, 0)))  # default to red

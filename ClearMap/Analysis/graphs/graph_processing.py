@@ -13,17 +13,17 @@ __webpage__ = 'https://idisco.info'
 __download__ = 'https://www.github.com/ChristophKirst/ClearMap2'
 
 import functools
-import multiprocessing
 import warnings
 from typing import Dict, Callable, List, Sequence, runtime_checkable, Protocol
 
 import numpy as np
 
-import ClearMap.IO.IO as io
+from ClearMap.IO import io_ops
 
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
 import ClearMap.ImageProcessing.Topology.Topology3d as t3d
 import ClearMap.Utils.Timer as tmr
+import ClearMap.Utils.array_checks as ac
 
 from ClearMap.Analysis.graphs import graph_gt
 from ClearMap.Analysis.graphs.fast_graph_reduce import find_degree2_branches, cy_reduce
@@ -154,6 +154,44 @@ DEFAULT_VERTEX_TO_VERTEX = {
     'chain_id': np.mean,
     # 'chain_id': functools.partial(np.quantile, 0.5, method='nearest', axis=0),
     '_vertex_id_': np.min
+}
+
+
+def incident_edges_max(connectivity: np.ndarray, edge_values: np.ndarray, n_vertices: int) -> np.ndarray:
+    """
+    The maximum of the values of the edges incident to each vertex (0 for a vertex without edges).
+
+    Parameters
+    ----------
+    connectivity: np.ndarray
+        (n_edges, 2) end vertices of each edge, in edge id order like edge_values
+        (graph.edge_connectivity(order='eid')).
+    edge_values: np.ndarray
+        One non-negative value per edge.
+    n_vertices: int
+    """
+    vertex_values = np.zeros(n_vertices, dtype=edge_values.dtype)
+    np.maximum.at(vertex_values, connectivity[:, 0], edge_values)
+    np.maximum.at(vertex_values, connectivity[:, 1], edge_values)
+    return vertex_values
+
+
+def incident_edges_half_sum(connectivity: np.ndarray, edge_values: np.ndarray, n_vertices: int) -> np.ndarray:
+    """
+    Half the sum of the values of the edges incident to each vertex: every edge has two ends, so each
+    end gets half of it and the vertex values add up to the edge values (e.g. the total length),
+    whatever the degrees. A self loop gives its whole value to its vertex.
+
+    Parameters: see incident_edges_max
+    """
+    ends_values = np.repeat(edge_values, 2)  # Aligned with connectivity.ravel(): [src_0, dst_0, src_1, ...]
+    return np.bincount(connectivity.ravel(), weights=ends_values, minlength=n_vertices) / 2
+
+
+DEFAULT_EDGE_TO_VERTEX = {  # f(connectivity, edge_values, n_vertices) -> vertex_values
+    'radii': incident_edges_max,
+    'radius_units': incident_edges_max,
+    'length': incident_edges_half_sum,
 }
 
 ###############################################################################
@@ -326,7 +364,7 @@ def graph_from_skeleton(skeleton, points=None, radii=None,
     if compute_edge_length and not compute_vertex_coordinates:
         raise ValueError('Activating `compute_edge_length` requires `compute_vertex_coordinates` to be True!')
 
-    skeleton = io.edit(skeleton)  # WARNING: ``edit`` here because delete_border (optional) is in-place
+    skeleton = io_ops.edit(skeleton)  # WARNING: ``edit`` here because delete_border (optional) is in-place
     if skeleton.dtype not in ('bool', np.uint8):
         raise TypeError('The skeleton array needs to be a boolean array!')
 
@@ -830,7 +868,7 @@ class PropertyAggregator:
         offsets = np.cumsum([0] + [len(x) for x in self.chain_indices]).astype(np.uint64)
         self.offsets = offsets
 
-        n_procs = max(1, self.n_processes if self.n_processes is not None else multiprocessing.cpu_count() - 2)
+        n_procs = sanitize_n_processes(-2 if self.n_processes is None else self.n_processes)
 
         for prop_name, arr in self.properties.items():
             reduction_fn = self.aggregation_functions[prop_name]
@@ -842,7 +880,7 @@ class PropertyAggregator:
 
             tmp_dtype = getattr(reduction_fn, 'tmp_dtype', out_dtype) # for percentile, we need the intermediate means in float
             mapped = np.zeros(len(self.chain_indices), dtype=tmp_dtype)  # pre-allocate output array
-            success = cy_reduce(arr, mapped, idx_stack=idx_stack, offsets=offsets,
+            success = cy_reduce(ac.bool_as_uint8(arr), ac.bool_as_uint8(mapped), idx_stack=idx_stack, offsets=offsets,
                                 reducer_fn=reduction_fn, num_threads=n_procs)
             if not success:  # pure Python fallback if Cython fails
                 starts, ends = offsets[:-1], offsets[1:]

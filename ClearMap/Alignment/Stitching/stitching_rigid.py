@@ -20,15 +20,17 @@ import copy
 import itertools as itt
 import functools as ft
 import inspect as insp
+import os
+import pickle
+import warnings
 
 import numpy as np
-import multiprocessing as mp
 import concurrent.futures
 
-import ClearMap.IO.IO as io
-import ClearMap.IO.Source as src
-import ClearMap.IO.Slice as slc
-import ClearMap.IO.FileList as fl
+from ClearMap.IO import io_ops
+import ClearMap.IO.source.Source as src
+import ClearMap.IO.source.Slice as slc
+import ClearMap.IO.source.backends.file_list_backend as fl
 
 import ClearMap.ParallelProcessing.ParallelTraceback as ptb
 
@@ -39,8 +41,9 @@ from ClearMap.Utils.Formatting import ensure
 
 from ClearMap.Alignment.Stitching.layout_graph_utils import (get_connected_components, connect_sources,
                                                              get_positions_from_tree)
+from ClearMap.Utils.exceptions import ClearMapIoException
 
-from ClearMap.Utils.utilities import CancelableProcessPoolExecutor
+from ClearMap.Utils.utilities import CancelableProcessPoolExecutor, sanitize_n_processes
 
 from ClearMap.Utils.Lazy import lazy_mixin
 
@@ -386,10 +389,26 @@ class SourceRegion(Region):
     pass
 
 
-class Source(SourceRegion, src.AbstractSource):
+COUNTS        = src.ReprField('_counts', convert=lambda c: f'<<{c[0]:d}s, {c[1]:d}a>>')
+
+_STITCH_FIELDS = (
+    src.ReprField('id', '()', convert=lambda i: f'#{i:d}'),
+    src.ReprField('tile_position', convert=lambda t: f'T{tuple(t)!r}'),
+    src.ReprField('position', convert=lambda p: f'P{list(p)!r}'),
+    src.ReprFields.SHAPE,
+    src.ReprFields.DTYPE,
+    src.ReprFields.ORDER,
+    src.ReprField('location', '{}',
+                  convert=lambda l: str(l) if len(str(l)) <= 25 else '...' + str(l)[-25:])
+)
+
+
+
+class StitchSource(SourceRegion, src.AbstractSource):
     """Class to handle basic data sources in a layout for stitching."""
 
     #__slots__ = ('_position', '_shape', '_dtype', '_order', '_location')
+    _REPR_FIELDS = (src.ReprFields.NAME,) + _STITCH_FIELDS
 
     counter = 0
     """Counter for the sources used to create unique ids."""
@@ -406,14 +425,15 @@ class Source(SourceRegion, src.AbstractSource):
         tile_position : array or None
           Optional position of this source in a tiling grid.
         """
-        if source is not None:
-            source = io.open_ro(source)
-            sid = None
-        if isinstance(source, Source):
+        sid = None
+        # WARNING: do not invert order here
+        if isinstance(source, StitchSource):  # re-wrapping (e.g. WobblyLayout converting its sources): reuse the inner source
             position = source.position if position is None else position
             tile_position = source.tile_position if tile_position is None else tile_position
             sid = source.id
             source = source.source
+        elif source is not None:
+            source = io_ops.open_ro(source)
 
         shape = source.shape
         if shape is None:
@@ -430,14 +450,14 @@ class Source(SourceRegion, src.AbstractSource):
         self._tile_position = ensure(tile_position, tuple)
 
         if sid is None:
-            self._id = Source.counter
-            Source.counter += 1
+            self._id = StitchSource.counter
+            StitchSource.counter += 1
         else:
             self._id = sid
 
     @property
     def name(self):
-        return f'Stitchable-{self.source.name}'
+        return f'{type(self).__name__}[{self.source.name}]'
 
     @property
     def id(self):
@@ -529,8 +549,7 @@ class Source(SourceRegion, src.AbstractSource):
         slicing[axis] = local_coordinate
         slicing = tuple(slicing)
 
-        return Slice(source=self, slicing=slicing)
-
+        return StitchSlice(source=self, slicing=slicing)
 
     def as_virtual(self):
         new = self.copy()
@@ -545,21 +564,6 @@ class Source(SourceRegion, src.AbstractSource):
     def __getitem__(self, *args):
         return self._source.__getitem__(*args)
 
-    #def __setitem__(self, *args):
-    #  self._source.__setitem__(*args);
-
-    def __str__(self):
-        return _source_string(self)
-
-    # other source attributes
-    #def __getattr__(self, name):
-    #  print 'getattr', self.__class__, name
-    #  print self._source.__class__
-    #  if not hasattr(self._source, name):
-    #    raise AttributeError('The source does not have the attribute %s!' % name);
-    #  return getattr(self._source, name);
-
-
     @property
     def location(self):
         return self._source.location
@@ -573,8 +577,10 @@ class Source(SourceRegion, src.AbstractSource):
         return p3d.plot(self.source)
 
 
-class Slice(slc.Slice, SourceRegion):
+class StitchSlice(slc.Slice, SourceRegion):
     """Class to handle a slice of a stitchable source."""
+    _REPR_FIELDS = (src.ReprFields.NAME,) + _STITCH_FIELDS
+
 
     def __init__(self, source, position = None, tile_position = None, slicing = None):
         """Slice class constructor.
@@ -591,7 +597,7 @@ class Slice(slc.Slice, SourceRegion):
           The slice specification to obtain this slice.
         """
         if not isinstance(source, SourceRegion):
-            source = Source(source = source, position = position, tile_position = tile_position)
+            source = StitchSource(source = source, position = position, tile_position = tile_position)
 
         SourceRegion.__init__(self, position = None, shape = None)
         slc.Slice.__init__(self, source = source, slicing = slicing)
@@ -651,16 +657,6 @@ class Slice(slc.Slice, SourceRegion):
     def tile_position(self):
         return self._source.tile_position
 
-    def __str__(self):
-        return _source_string(self)
-
-    # source attributes
-    #def __getattr__(self, name):
-    #  if not hasattr(self.source, name):
-    #    raise AttributeError('The source does not have the attribute %s!' % name);
-    #  return getattr(self.source, name);
-
-
     def as_virtual(self):
         new = self.copy()
         new._source = self._source.as_virtual()
@@ -670,61 +666,6 @@ class Slice(slc.Slice, SourceRegion):
         new = self.copy()
         new._source = self._source.as_real()
         return new
-
-
-def _source_string(self):
-    """Helper to generate a string describing a source with positional information."""
-    try:
-        name = self.name
-        name = f'{name}' if name is not None else ''
-    except:
-        name =''
-
-    try:
-        shape = self.shape
-        shape ='%r' % ((shape,)) if shape is not None else ''
-    except:
-        shape = ''
-
-    try:
-        dtype = self.dtype
-        dtype = f'[{dtype}]' if dtype is not None else ''
-    except:
-        dtype = ''
-
-    try:
-        order = self.order
-        order = f'|{order}|' if order is not None else ''
-    except:
-        order = ''
-
-    try:
-        location = self.source.location
-        location = f'{location}' if location is not None else ''
-        if len(location) > 25:
-            #location = location[:25] + '...' + location[-25:]
-            location = '...' + location[-25:]
-        if len(location) > 0:
-            location = f'{{{location}}}'
-    except:
-        location = ''
-
-    try:
-        position = f"P{list(self.position)!r}"
-    except:
-        position = ''
-
-    try:
-        tile_position = f"T{tuple(self.tile_position)!r}"
-    except:
-        tile_position = ''
-
-    try:
-        ids = f'(#{self.id:d})'
-    except:
-        ids = ''
-
-    return name + ids + tile_position + position + shape + dtype + order + location
 
 
 ########################################################################################
@@ -922,6 +863,7 @@ class Alignment(AlignmentBase):
 
 class Layout(SourceRegion, src.AbstractSource):
     """Base class to handle the layout of multiple sources."""
+    _REPR_FIELDS = (src.ReprFields.NAME, COUNTS) + _STITCH_FIELDS
 
     def __init__(self, sources, alignments = None, position = None, shape = None, dtype = None, order = None, location = None):
         """Layout constructor.
@@ -944,8 +886,12 @@ class Layout(SourceRegion, src.AbstractSource):
         SourceRegion.__init__(self, position = position, shape = shape)
         src.AbstractSource.__init__(self, source = None, shape = shape, dtype = dtype, order = order, location = location)
 
-        self._sources = [s if isinstance(s, SourceRegion) else Source(source = s) for s in sources]
+        self._sources = [s if isinstance(s, SourceRegion) else StitchSource(source = s) for s in sources]
         self._alignments = [] if alignments is None else alignments
+
+    @property
+    def _counts(self):
+        return self.n_sources, self.n_alignments
 
     @property
     def sources(self):
@@ -1352,7 +1298,7 @@ class Layout(SourceRegion, src.AbstractSource):
         initial_locations = [s.location for s in self.sources]
 
         if match is None or method == 'infer':
-            from ClearMap.IO.metadata import PatternFinder
+            from ClearMap.IO.tile_patterns import PatternFinder
             df = PatternFinder.file_list_to_df(initial_locations)
             pattern = PatternFinder.pattern_from_df(df)
             axes = te.Expression(replace).tag_names()
@@ -1551,8 +1497,8 @@ class Layout(SourceRegion, src.AbstractSource):
           If not None, clip the sources at this value when calculating the alignment.
         background : number or None
           If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-        processes : int or 'serial'
-          Number of processor to use for parallel processing, if 'serial' process in serial.
+        processes : int or None
+          Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
         verbose : bool
           Print progress information.
         """
@@ -1681,15 +1627,6 @@ class Layout(SourceRegion, src.AbstractSource):
         new = self.copy()
         new.sources_as_real()
         return new
-
-    def __str__(self):
-        name = self.name
-        s = _source_string(self)
-        layout = f"<<{self.n_sources:d}s, {self.n_alignments:d}a>>"
-        return name + layout + s[len(name):]
-
-    def __repr__(self):
-        return self.__str__()
 
 
 class TiledLayout(Layout):
@@ -1923,8 +1860,8 @@ class TiledLayout(Layout):
           If not None, clip the sources at this value when calculating the alignment.
         background : number or None
           If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-        processes : int or 'serial'
-          Number of processor to use for parallel processing, if 'serial' process in serial.
+        processes : int or None
+          Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
         verbose : bool
           If True, print progress information.
 
@@ -1987,10 +1924,10 @@ def _initialize_tiles_from_sources(sources, tile_shape = None, tile_positions = 
     src = []; pos = []
     for s, p in zip(sources, tile_positions):
         if s is not None:
-            if isinstance(s, Source):
+            if isinstance(s, StitchSource):
                 src.append(s)
             else:
-                src.append(Source(source = s))
+                src.append(StitchSource(source = s))
             pos.append(p)
     sources = src
     tile_positions = pos
@@ -2057,6 +1994,10 @@ def _initialize_tiles_from_expression(expression, tile_axes = None, tile_shape =
 
     # construct tiling
     files = fl._file_list(expression)
+    for f in files:
+        if not os.path.exists(f):
+            raise ClearMapIoException(f'File {f!r} does not exist! '
+                                      f'Cannot proceed with TiledLayout initialization from expression {expression!r}.')
     tile_values = [expression.values(f) for f in files]
     tile_values = [tuple(tv[n] for n in tile_axes) for tv in tile_values]
 
@@ -2250,6 +2191,37 @@ def save_layout(filename, layout):
     fid.close()
 
     return filename
+
+
+_BACKENDS = 'ClearMap.IO.source.backends'
+_STITCHING = 'ClearMap.Alignment.Stitching'
+
+# (module, class) recorded in layout files saved by older versions -> (module, class) today.
+_RENAMED_CLASSES = {
+    # IO backends (tile sources); layouts hold the virtual ones, save_layout calls layout.as_virtual()
+    ('ClearMap.IO.MMP', 'Source'):        (f'{_BACKENDS}.mmp_backend', 'MMPSource'),
+    ('ClearMap.IO.MMP', 'VirtualSource'): (f'{_BACKENDS}.mmp_backend', 'MMPVirtualSource'),
+    (f'{_STITCHING}.stitching_wobbly', 'WobblySource'): (f'{_STITCHING}.stitching_wobbly', 'WobblyStitchSource'),
+    # Defensive: other tile formats and renamed stitching classes
+    ('ClearMap.IO.TIF', 'Source'):        (f'{_BACKENDS}.tif_backend', 'TifSource'),
+    ('ClearMap.IO.TIF', 'VirtualSource'): (f'{_BACKENDS}.tif_backend', 'TifVirtualSource'),
+    ('ClearMap.IO.NPY', 'Source'):        (f'{_BACKENDS}.npy_backend', 'NumpySource'),
+    # Stitching renames
+    (f'{_STITCHING}.stitching_rigid', 'Source'): (f'{_STITCHING}.stitching_rigid', 'StitchSource'),
+    (f'{_STITCHING}.stitching_rigid', 'Slice'):  (f'{_STITCHING}.stitching_rigid', 'StitchSlice'),
+}
+
+
+class _LayoutUnpickler(pickle.Unpickler):
+    """Unpickler that maps renamed or moved classes, so layouts saved by older versions still load."""
+
+    def find_class(self, module, name):
+        if (module, name) in _RENAMED_CLASSES:
+            new_module, new_name = _RENAMED_CLASSES[(module, name)]
+            warnings.warn(f'Layout file uses {module}.{name}, now {new_module}.{new_name}; '
+                          f'save it again to update it.', DeprecationWarning, stacklevel=2)
+            module, name = new_module, new_name
+        return super().find_class(module, name)
 
 
 def load_layout(filename):
@@ -2675,9 +2647,9 @@ def align_2_sources_along_axis(src1, src2, axis = 0, overlap = 10, max_shifts = 
     This routine simply translates overlap specifications in one axis direction into max_shifts for use with align_2_sources.
     """
     if not isinstance(src1, SourceRegion):
-        src1 = Source(src1)
+        src1 = StitchSource(src1)
     if not isinstance(src2, SourceRegion):
-        src2 = Source(src2)
+        src2 = StitchSource(src2)
 
     if src1.ndim != src2.ndim:
         raise ValueError(f'Images expected to have the same dimensions,'
@@ -2756,9 +2728,9 @@ def align_2_sources_along_axis_mip(src1, src2, axis = 2, depth = 10, max_shifts 
       Optional maximum intensity projections.
     """
     if not isinstance(src1, SourceRegion):
-        src1 = Source(src1)
+        src1 = StitchSource(src1)
     if not isinstance(src2, SourceRegion):
-        src2 = Source(src2)
+        src2 = StitchSource(src2)
 
     if src1.ndim != src2.ndim:
         raise ValueError(f'Images expected to have the same dimensions, '
@@ -2789,8 +2761,8 @@ def align_2_sources_along_axis_mip(src1, src2, axis = 2, depth = 10, max_shifts 
     p2 = src2.position[:axis] + src2.position[axis+1:]
     #print axis, p1, p2
 
-    mip1 = Source(mip1, position = p1, tile_position = src1.tile_position)
-    mip2 = Source(mip2, position = p2, tile_position = src2.tile_position)
+    mip1 = StitchSource(mip1, position = p1, tile_position = src1.tile_position)
+    mip2 = StitchSource(mip2, position = p2, tile_position = src2.tile_position)
     #print mip1, mip2
 
     mip_shift, quality = align_2_sources(mip1, mip2, max_shifts = max_shifts, clip = clip, background = background, verbose = verbose)
@@ -2822,8 +2794,8 @@ def align_layout(layout, max_shifts = 10, clip = None, background = None, proces
       If not None, clip the soruces at this value when calculating the alignment.
     background : number or None
       If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-    processes : int or 'serial'
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       If True, print progress information.
 
@@ -2842,13 +2814,12 @@ def align_layout(layout, max_shifts = 10, clip = None, background = None, proces
         timer = tmr.Timer()
         print(f'Alignment: Aligning {layout!r}')
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
     _align = ft.partial(_align_layout, n_alignments=n_alignments, max_shifts=max_shifts,
                         clip=clip, background=background, verbose=verbose)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post, i) for i,a in enumerate(layout.alignments)]
     else:
         layout.sources_as_virtual()
@@ -2895,8 +2866,8 @@ def align_layout_on_tiling(layout, overlaps = 10, max_shifts = 10, clip = None, 
       If not None, clip the soruces at this value when calculating the alignment.
     background : number or None
       If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-    processes : int or 'serial'
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       If True, print progress information.
 
@@ -2928,10 +2899,9 @@ def align_layout_on_tiling(layout, overlaps = 10, max_shifts = 10, clip = None, 
                         overlaps=overlaps, max_shifts=max_shifts,
                         clip=clip, background=background, verbose=verbose)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post, ax, i) for a,ax,i in zip(alignments, axes, range(n_alignments))]
     else:
         layout.sources_as_virtual()
@@ -2982,8 +2952,8 @@ def align_layout_axis(layout, axis = 2, depth = 10, max_shifts = 10, axis_range 
       If not None, clip the soruces at this value when calculating the alignment.
     background : number or None
       If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-    processes : int or 'serial'
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       Print progress information.
 
@@ -3016,10 +2986,9 @@ def align_layout_axis(layout, axis = 2, depth = 10, max_shifts = 10, axis_range 
                         depth=depth, max_shifts=max_shifts,
                         clip=clip, background=background, verbose=verbose)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post, i) for i,a in enumerate(layout.alignments)]
     else:
         layout.sources_as_virtual()
@@ -3057,13 +3026,13 @@ def _align_layout_axis(src1, src2, aid, n_alignments, axis, axis_range, depth, m
         sl1 = list(sl)
         sl1[axis] = slice(axis_range[0] - p1[axis], axis_range[1] - p1[axis])
         sl1 = tuple(sl1)
-        src1 = Slice(source = src1, slicing = sl1)
+        src1 = StitchSlice(source = src1, slicing = sl1)
 
         p2 = list(src2.position)
         sl2 = list(sl)
         sl2[axis] = slice(axis_range[0] - p2[axis], axis_range[1] - p2[axis])
         sl2 = tuple(sl2)
-        src2 = Slice(source = src2, slicing = sl2)
+        src2 = StitchSlice(source = src2, slicing = sl2)
 
         #mip axis
     #  t1 = src1.tile_position;
@@ -3120,8 +3089,8 @@ def align_layout_rigid_mip(layout, depth=10, max_shifts=10, ranges=None, clip=No
       If not None, clip the sources at this value when calculating the alignment.
     background : number or None
       If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-    processes : int or 'serial' layout.alig
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       Print progress information.
 
@@ -3154,10 +3123,9 @@ def align_layout_rigid_mip(layout, depth=10, max_shifts=10, ranges=None, clip=No
                         depth=depth, max_shifts=max_shifts, ranges=ranges,
                         clip=clip, background=background, verbose=verbose)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post, i) for i,a in enumerate(layout.alignments)]
     else:
         layout.sources_as_virtual()
@@ -3227,8 +3195,8 @@ def _align_layout_ridgid_mip(src1, src2, aid, n_alignments, depth, max_shifts, r
                 sl1 += (slice(None),)
                 sl2 += (slice(None),)
 
-        src1 = Slice(source = src1, slicing = sl1)
-        src2 = Slice(source = src2, slicing = sl2)
+        src1 = StitchSlice(source = src1, slicing = sl1)
+        src2 = StitchSlice(source = src2, slicing = sl2)
 
     result = align_2_sources_along_axis_mip(src1, src2, axis = mip_axis, depth = mip_depth, max_shifts = max_shifts, clip = clip, background = background, verbose = False)
 
@@ -3260,8 +3228,8 @@ def align_layout_rigid_mips(layout, depth = 10, max_shifts = 10, ranges = None, 
       If not None, clip the soruces at this value when calculating the alignment.
     background : number or None
       If not None, if the values in the overlap region are less than this number make alignment return -inf quality as there is no signal to use for alignment.
-    processes : int or 'serial' layout.alig
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       Print progress information.
 
@@ -3294,10 +3262,9 @@ def align_layout_rigid_mips(layout, depth = 10, max_shifts = 10, ranges = None, 
                         depth=depth, max_shifts=max_shifts, ranges=ranges,
                         clip=clip, background=background, verbose=verbose)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post, i) for i,a in enumerate(layout.alignments)]
     else:
         layout.sources_as_virtual()
@@ -4190,10 +4157,11 @@ def stitch_layout(layout, sink = None, method = 'interpolation', verbose = False
 
 def _test():
     import ClearMap.Alignment.Stitching.stitching_rigid as stb
+    from ClearMap.IO.FileUtils import delete_file
     from importlib import reload
     reload(stb)
 
-    #overlaps and embeddings
+    # overlaps and embeddings
     r1 = stb.Region(lower = (0,0), upper = (100,100))
     r2 = stb.Region(lower = (80,20), upper = (180, 120))
     r = stb.embedding([r1,r2])
@@ -4205,18 +4173,18 @@ def _test():
     import ClearMap.Tests.Files as tfs
     data = np.load(tfs.vasculature_pre)[:,:100,:100]
 
-    #divide data
+    # divide data
     data1 = data[:210,:,:]
     data2 = data[200:,:,:]
 
-    #reload(stb)
-    s1 = stb.Source(source=data1, position = (0,0,0))
-    s2 = stb.Source(source=data2, position = (190,0,0))
+    # reload(stb)
+    s1 = stb.StitchSource(source=data1, position = (0, 0, 0))
+    s2 = stb.StitchSource(source=data2, position = (190, 0, 0))
 
     stb.align_2_sources(s1, s2, max_shifts = 20)
 
 
-    #Slicing layouts
+    # Slicing layouts
     l = stb.Layout(sources = [s1, s2], alignments = [stb.Alignment(pre=s1, post=s2)])
 
     l.alignments[0].plot_overlay()
@@ -4241,7 +4209,7 @@ def _test():
 
     l.alignments[0].plot_overlay()
 
-    #Tiled layouts
+    # Tiled layouts
     reload(stb)
     l = stb.TiledLayout([data1, data2], overlaps = 15)
     l.plot_regions()
@@ -4258,11 +4226,11 @@ def _test():
     np.all(d == data)
     stb.p3d.plot(d)
 
-    #2d Tiles
+    # 2d Tiles
     data = np.load(tfs.vasculature_pre)[:,:,:100]
     data.shape
 
-    #divide data
+    # divide data
     data1 = data[:220,:220,:]
     data2 = data[200:,:215,:]
     data3 = data[:208,200:,:]
@@ -4288,10 +4256,9 @@ def _test():
     # Tiles from files
     expression = stb.te.Expression('test_<X,I,2>_<Y,I,4>.tif')
 
-    import ClearMap.IO.IO as io
     for i in range(len(tiling)):
         for j in range(len(tiling[i])):
-            io.write(expression.string({'X' : i, 'Y' : j}), tiling[i][j])
+            io_ops.write(expression.string({'X' : i, 'Y' : j}), tiling[i][j])
 
     reload(stb)
     l = stb.TiledLayout(expression = expression)
@@ -4306,7 +4273,7 @@ def _test():
     stb.p3d.plot(s)
 
     np.all(s == data)
-    #cleanup
+    # cleanup
     for i in range(len(tiling)):
         for j in range(len(tiling[i])):
-            stb.io.delete_file(expression.string({'X' : i, 'Y' : j}))
+            delete_file(expression.string({'X' : i, 'Y' : j}))

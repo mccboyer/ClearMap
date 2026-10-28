@@ -17,7 +17,6 @@ __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
 import gc
-import multiprocessing
 import shutil
 import tempfile
 import warnings
@@ -44,11 +43,12 @@ import ClearMap.Analysis.Measurements.shape_detection as sd
 import ClearMap.Analysis.Measurements.MeasureExpression as me
 
 import ClearMap.Utils.Timer as tmr
+from ClearMap.IO import io_ops, source_geometry
 from ClearMap.ImageProcessing.Experts.utils import initialize_sinks, run_step, print_params
 from ClearMap.ImageProcessing.LocalStatistics import local_percentile
 
 from ClearMap.Utils.exceptions import ClearMapValueError
-from ClearMap.Utils.utilities import sanitize_n_processes
+from ClearMap.Utils.utilities import sanitize_n_processes, available_cpu_count
 
 ###############################################################################
 # ## Default parameter
@@ -301,12 +301,12 @@ def detect_cells(source, sink=None, cell_detection_parameter=default_cell_detect
     """
 
     # initialize sink
-    initialize_sinks(cell_detection_parameter, clearmap_io.shape(source), clearmap_io.order(source))
+    initialize_sinks(cell_detection_parameter, source_geometry.shape(source), source_geometry.order(source))
 
     cell_detection_parameter.update(verbose=processing_parameter.get('verbose', False))
 
     n_processes = sanitize_n_processes(processing_parameter.get('processes'))
-    n_threads = max(1, int(multiprocessing.cpu_count() / n_processes))  # Number of threads so that * n_processes, fills CPUs
+    n_threads = max(1, int(available_cpu_count() / n_processes))  # Number of threads so that * n_processes, fills CPUs
 
     sink_location = clearmap_io.location(sink) if sink is not None else None
     sink_path = Path(sink_location) if sink_location is not None else None
@@ -409,8 +409,8 @@ def detect_cells_block(source, parameter=default_cell_detection_parameter,
         maxima = run_step('maxima_detection', dog, md.find_maxima, extra_kwargs={'verbose': parameter.get('verbose')},
                           remove_previous_result=False, **default_step_params)
         # center of maxima
-        if parameter_maxima['h_max']:  # FIXME: check if source or dog
-            centers = md.find_center_of_maxima(source, maxima=maxima, verbose=parameter.get('verbose'))
+        if parameter_maxima['h_max']:
+            centers = md.find_center_of_maxima(source.array, maxima=maxima, verbose=parameter.get('verbose'))
         else:
             if parameter_shape:
                 threshold = parameter_shape.get('threshold', 0)
@@ -606,14 +606,15 @@ def filter_cells(source, sink, thresholds):
         Dictionary of the form {name : threshold} where name refers to the
         column in the cell data and threshold can be None, a float
         indicating a minimal threshold or a tuple (min, max) where min, max can be
-        None or a minimal and maximal threshold value.
+        None or a minimal and maximal threshold value. Both bounds are inclusive, so
+        that a cell at the saturation value of the dtype passes a default max filter.
 
     Returns
     -------
     sink : str, array or Source
         The thresholded cell data.
     """
-    source = clearmap_io.open_ro(source)
+    source = io_ops.open_ro(source)
 
     cells_mask = np.ones(source.shape[0], dtype=bool)
     for filter_name, thrsh in thresholds.items():
@@ -622,11 +623,11 @@ def filter_cells(source, sink, thresholds):
                 thrsh = (thrsh, None)
             if thrsh[0] is not None:  # high pass
                 cells_mask = np.logical_and(cells_mask, thrsh[0] <= source[filter_name])
-            if thrsh[1] is not None:  # low pass
-                cells_mask = np.logical_and(cells_mask, thrsh[1] > source[filter_name])
+            if thrsh[1] is not None:  # low pass (inclusive)
+                cells_mask = np.logical_and(cells_mask, source[filter_name] <= thrsh[1])
     cells_filtered = source[cells_mask]
 
-    return clearmap_io.write(sink, cells_filtered)
+    return io_ops.write(sink, cells_filtered)
 
 
 ###############################################################################

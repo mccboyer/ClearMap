@@ -15,7 +15,6 @@ __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
   
 import gc
-import tempfile
 import warnings
 from pathlib import Path
 
@@ -23,7 +22,8 @@ import numpy as np
 import scipy.ndimage as ndi
 import skimage.filters as skif
 
-import ClearMap.IO.IO as io
+from ClearMap.IO import FileUtils as file_utils
+from ClearMap.IO import source_initialization, io_ops, source_geometry
 
 import ClearMap.ParallelProcessing.BlockProcessing as bp
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
@@ -37,7 +37,6 @@ import ClearMap.ImageProcessing.Binary.Smoothing as bs
 
 import ClearMap.Utils.Timer as tmr
 from ClearMap.ImageProcessing.Experts.utils import initialize_sinks, run_step, print_params
-from ClearMap.Utils.utilities import get_free_temp_space, bytes_to_human
 
 ###############################################################################
 # ## Generic parameter
@@ -464,8 +463,8 @@ def binarize(source, sink=None, binarization_parameter=default_binarization_para
     """
 
     # initialize sink
-    shape = io.shape(source)
-    order = io.order(source)
+    shape = source_geometry.shape(source)
+    order = source_geometry.order(source)
     sink, sink_buffer = ap.initialize_sink(sink=sink, shape=shape, order=order, dtype=bool)  # , memory='shared')
 
     # initialize addition output sinks
@@ -502,7 +501,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
     # initialize binary status for inspection
     binary_status = parameter.get('binary_status')
     if binary_status:
-        binary_status = io.open_ro(binary_status)
+        binary_status = io_ops.open_ro(binary_status)
         binary_status = binary_status[base_slicing]
 
     default_step_params = {'parameter': parameter, 'steps_to_measure': {}, 'prefix': prefix,
@@ -520,7 +519,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         not_low = np.logical_not(low)
 
         if save:
-            save = io.initialize(save)  # edit or create
+            save = source_initialization.initialize(save)  # edit or create
             save[base_slicing] = clipped[valid_slicing]
 
         if binary_status is not None:
@@ -564,7 +563,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         del binarized
 
         if save:
-            save = io.initialize(save)  # edit or create
+            save = source_initialization.initialize(save)  # edit or create
             save[base_slicing] = deconvolved[valid_slicing]
 
         if verbose:
@@ -618,7 +617,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
         equalized = equalize(median, mask=mask, **parameter_equalize)
 
         if save:
-            save = io.initialize(save)  # edit or create
+            save = source_initialization.initialize(save)  # edit or create
             save[base_slicing] = equalized[valid_slicing]
 
         if verbose:
@@ -665,7 +664,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
             del background
 
             if save:
-                save = io.initialize(save)  # edit or create
+                save = source_initialization.initialize(save)  # edit or create
                 save[base_slicing] = tubeness[valid_slicing]
         else:
             tubeness = equalized
@@ -675,7 +674,7 @@ def binarize_block(source, sink, parameter=default_binarization_parameter):
 
         save = parameter_vesselization.get('save')
         if save:
-            save = io.initialize(save)  #  edit or create
+            save = source_initialization.initialize(save)  #  edit or create
             save[base_slicing] = tubeness[valid_slicing]
 
         if verbose:
@@ -792,7 +791,7 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
         warnings.warn('No postprocessing steps defined, skipping postprocessing.')
         return
 
-    source = io.open_ro(source)
+    source = io_ops.open_ro(source)
     sink = ap.initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
     if verbose:
@@ -811,7 +810,7 @@ def postprocess(source, sink=None, postprocessing_parameter=default_postprocessi
     if run_binary_filling:
         bf.fill(fill_source, sink=sink, processes=processes, verbose=verbose)
         if parameter_smooth and not keep_smoothed:  # FIXME: should be in a finaly block
-            io.delete_file(tmp_f_path)
+            file_utils.delete_file(tmp_f_path)
 
     if verbose:
         timer.print_elapsed_time('Binary post processing')
@@ -886,7 +885,7 @@ def threshold_isodata(source):
 
 def threshold_adaptive(source, function=threshold_isodata, selem=(100, 100, 3), spacing=(25, 25, 3),
                        interpolate=1, mask=None, step=None):
-    source = io.read(source)[:]
+    source = io_ops.read(source)[:]
     threshold = ls.apply_local_function(source, function=function, mask=mask, dtype=float,
                                         selem=selem, spacing=spacing, interpolate=interpolate, step=step)
     return threshold
@@ -952,7 +951,7 @@ def binary_statistics(source):
     statistics : dict
        A dict with entires {description : count}.
     """
-    status, counts = np.unique(io.read(source)[:], return_counts=True)
+    status, counts = np.unique(io_ops.read(source)[:], return_counts=True)
     return {status_to_description(s): c for s, c in zip(status, counts)}
 
 
@@ -987,8 +986,8 @@ def _test():
     binary = vasc.binarize(source, sink=sink, binarization_parameter=bpar, processing_parameter=ppar)
     p3d.plot([source, binary])
 
-    import ClearMap.IO.IO as io
-    io.delete_file(sink)
+    from ClearMap.IO import FileUtils as file_utils
+    file_utils.delete_file(sink)
 
     pppar = vasc.default_postprocessing_parameter.copy()
     pppar['smooth']['iterations'] = 3

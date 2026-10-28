@@ -29,17 +29,22 @@ ClearMapException
 │   ├── ConfigNotFoundError
 │   ├── ConfigParsingError
 │   ├── AggregatedValidationError
-│   └── PatchConflictError
+│   ├── PatchConflictError
+│   └── ChannelsNotPixelAlignedError
 ├── PlotGraphError
 ├── ClearMapVRamException
 ├── SmiError
 └── GroupStatsError
+
+ClearMapWarning  (also RuntimeWarning; issued with ``warnings.warn``, not raised)
+├── SubscriberFailedWarning
+└── ReversedRegistrationWarning
 """
 from __future__ import annotations
 
 import inspect
 from enum import Enum
-from typing import List, Iterable, Tuple
+from typing import Iterable, Tuple
 from dataclasses import dataclass
 
 _SKIP_PATTERNS = ('wrapper', '_decorator', 'decorator', '__')
@@ -165,7 +170,7 @@ class ClearMapException(Exception):
     user_title: str = 'ClearMap Error'
     user_hint: str = ''
 
-    # Set on *instances* to override class-level recovery_options.
+    default_recovery_options: tuple[RecoveryOption, ...] | None = None
     _instance_options: tuple[RecoveryOption, ...] | None = None
 
     @property
@@ -177,15 +182,48 @@ class ClearMapException(Exception):
     def recovery_options(self) -> tuple[RecoveryOption, ...]:
         if self._instance_options is not None:
             return self._instance_options
+
+        if self.default_recovery_options is not None:
+            return self.default_recovery_options
+
         return DEFAULT_RECOVERY_OPTIONS.get(self.severity, (DISMISS,))
 
     @recovery_options.setter
     def recovery_options(self, options: tuple[RecoveryOption, ...]):
-        self._instance_options = options
+        self._instance_options = tuple(options)
+
+
+class ClearMapWarning(ClearMapException, RuntimeWarning):
+    """
+    Base for every ClearMap-specific warning: something went wrong that does not stop the operation
+    (issued with ``warnings.warn``, so the filters, e.g. of the tests, apply to it).
+    """
+    severity = Severity.DEGRADED
+    user_title = 'ClearMap Warning'
+
+
+class SubscriberFailedWarning(ClearMapWarning):
+    """
+    A subscriber raised while handling an event. The event happened: the other subscribers still receive it and the
+    publisher is not concerned (e.g. a config change is committed whether or not a tab fails to show it).
+    The tests turn it into an error (see pytest.ini).
+    """
+    user_title = 'Event Subscriber Failed'
+
+
+class ReversedRegistrationWarning(ClearMapWarning):
+    """
+    Points are transformed through a registration computed the other way round (the channel moved onto its partner,
+    moving_channel: self): the transform maps the points of the partner onto the channel, so the points of the channel
+    need its inverse, which is not supported yet. They end up at wrong positions.
+    """
+    user_title = 'Registration Computed the Other Way Round'
+    user_hint = ('Register the channel with its partner moving onto it (moving_channel: other) to transform its points, '
+                 'or invert the transform yourself.')
 
 
 # ---------------------------------------------------------------------------
-# Value / runtime
+# Standard exceptions forward
 # ---------------------------------------------------------------------------
 
 class ClearMapValueError(ClearMapException, ValueError):
@@ -235,6 +273,42 @@ class ClearMapRuntimeError(ClearMapException, RuntimeError):
         return '\n'.join(parts)
 
 
+
+class ClearMapTypeError(ClearMapException, TypeError):
+    """An argument or value is of a type ClearMap does not accept here (raised by ClearMap, not by the language)."""
+    severity = Severity.FATAL
+
+
+class ClearMapNotImplementedError(ClearMapException, NotImplementedError):
+    """An operation is not supported by the selected ClearMap backend.
+
+    This exception remains compatible with ``NotImplementedError`` while
+    allowing the GUI and callers to distinguish an unsupported ClearMap
+    operation from other implementation errors.
+    """
+
+    severity = Severity.FATAL
+    user_title = 'Unsupported Operation'
+    user_hint = 'Choose a supported operation or use a compatible file format.'
+    default_recovery_options = (DISMISS, )
+
+    def __init__(self, message: str, operation: str = '', backend: str = ''):
+        self.operation = operation
+        self.backend = backend
+        super().__init__(message)
+
+    @property
+    def user_message(self) -> str:
+        parts = [str(self)]
+
+        if self.operation:
+            parts.append(f'Operation: {self.operation}')
+
+        if self.backend:
+            parts.append(f'Backend: {self.backend}')
+
+        return '\n'.join(parts)
+
 # ---------------------------------------------------------------------------
 # I/O
 # ---------------------------------------------------------------------------
@@ -278,6 +352,39 @@ class SourceModuleNotFoundError(ClearMapIoException):
         self.ext = ext
         msg = f'Cannot determine module for file "{filename}" with extension "{ext}"!'
         super().__init__(msg)
+
+
+class SourceNotFoundError(ClearMapFileNotFoundError):
+    """The file backing this source does not exist on disk.
+
+    Distinct from AssetNotFoundError: this is the low-level IO layer reporting an
+    absent path, and is the *only* condition under which source_initialization.initialize() may
+    legitimately fall through to creating the source.
+    """
+    user_title = 'Source File Not Found'
+    severity = Severity.RECOVERABLE
+
+    def __init__(self, message: str, location: str = ''):
+        self.location = location
+        super().__init__(message)
+
+
+class SourceExistsError(ClearMapIoException, FileExistsError):
+    """A source already exists at this location and would have been destroyed."""
+    default_severity = Severity.RECOVERABLE
+
+    def __init__(self, location=None, message=None, **kwargs):
+        self.location = location
+        super().__init__(message or f'Source already exists at {location}', **kwargs)
+
+
+class IncompleteSourceSpecError(ClearMapValueError):
+    """Not enough information (shape / dtype / array) to create a new source."""
+    user_title = 'Incomplete Source Specification'
+    user_hint = 'Provide shape and dtype, or an array to create the source from.'
+
+    def __init__(self, message: str, value=None, expected=None):
+        super().__init__(message, value=value, expected=expected)
 
 
 class IncompatibleSource(ClearMapIoException):
@@ -568,6 +675,25 @@ class PatchConflictError(ClearMapConfigError):
 # Processing / pipeline
 # ---------------------------------------------------------------------------
 
+class ChannelsNotPixelAlignedError(ClearMapConfigError):
+    """
+    Channels which are processed pixel by pixel together (the parts of a TubeMap compound, a colocalization pair)
+    are not set up as pixel aligned: same atlas settings, shape and resolution, acquired together, stitched together.
+    ``unmet_requirements`` holds one message per requirement which is not met, naming the channels and the setting.
+    """
+    severity = Severity.RECOVERABLE
+    user_title = 'Channels Not Pixel Aligned'
+    user_hint = ('Set the channels up as imaged together: the same orientation, slicing and resolution, the same '
+                 'stitching layout, and all but one acquired together with another of them '
+                 '(registration Direction: Acquired together).')
+
+    def __init__(self, channels: Iterable[str], unmet_requirements: Iterable[str]):
+        self.channels = tuple(channels)
+        self.unmet_requirements = list(unmet_requirements)
+        super().__init__(f'The channels {", ".join(self.channels)} must be pixel aligned: '
+                         + '; '.join(self.unmet_requirements))
+
+
 class PlotGraphError(ClearMapException):
     """The requested graph visualisation cannot be rendered, usually because
     the vertex/edge count exceeds safe memory limits for the 3-D viewer.
@@ -613,6 +739,36 @@ class GroupStatsError(ClearMapException):
     """
     user_title = 'Group Statistics Error'
     user_hint = 'Ensure all samples in each group have matching density maps with identical dimensions.'
+
+
+class ChannelNameTakenError(ClearMapValueError):
+    """
+    A channel is given the name of another channel (whose settings and results it would take over).
+    Names are unique whatever the case, so ``Fos`` is the name of ``fos``.
+    """
+    severity = Severity.RECOVERABLE
+    user_title = 'Channel Name Already Used'
+    user_hint = 'Rename the other channel first, or choose another name.'
+
+
+class InvalidChannelNameError(ClearMapValueError):
+    """A channel name has characters other than letters, digits and underscores (``-`` joins compound channels)."""
+    severity = Severity.RECOVERABLE
+    user_title = 'Invalid Channel Name'
+    user_hint = 'Use only letters, digits and "_" in channel names.'
+
+
+class InvalidChannelIdError(ClearMapValueError):
+    """A channel id is not the text of a UUID4 (as written by ``str(uuid.uuid4())``): it is not a channel id at all."""
+    severity = Severity.FATAL
+    user_title = 'Invalid Channel Id'
+
+
+class UnknownChannelError(ClearMapValueError):
+    """A channel (by name or handle) is not one of the channels of the sample."""
+    severity = Severity.RECOVERABLE
+    user_title = 'Unknown Channel'
+    user_hint = 'Add the channel in the Sample Info tab, then retry.'
 
 
 class ParamsOrientationError(ClearMapValueError):

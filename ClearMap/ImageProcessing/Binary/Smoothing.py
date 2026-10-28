@@ -24,7 +24,7 @@ import scipy.ndimage as ndi
 
 import multiprocessing as mp
 
-import ClearMap.IO.IO as io
+from ClearMap.IO.source import Source as source_mod
 import ClearMap.IO.FileUtils as fu
 
 import ClearMap.ImageProcessing.Topology.Topology3d as t3d
@@ -33,6 +33,9 @@ import ClearMap.ParallelProcessing.BlockProcessing as bp
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
 
 import ClearMap.Utils.Timer as tmr
+from ClearMap.Utils.utilities import sanitize_n_processes
+from ClearMap.IO import source_initialization, io_ops
+
 
 ###############################################################################
 # Smoothing by number of neighbours
@@ -73,7 +76,7 @@ def smooth_by_counting(source, sink = None, low = 5, high = 10, shape = None):
   for d in range(ndim):
     weights = np.ones(shape[d], dtype = int)
     temp = np.zeros(source.shape, dtype = 'uint8')
-    ap.correlate1d(filtered, weights, sink=temp, axis=d, mode='constant', cval=0)
+    ap.correlate1d(filtered, weights, sink=temp, axis=d)  # zero padded borders (mode='constant', cval=0)
     filtered = temp
 
   if sink is None:
@@ -286,17 +289,15 @@ def generate_lookup_table(function = index_to_smoothing, verbose = True, process
   if verbose:
     print('Smoothing: Generating look-up table!')
     
-  if processes is None:
-    processes = mp.cpu_count()
-
-  if processes == 'serial':
+  processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
+  if processes == 0:
     lut = [function(i) for i in range(2**27)]
   else:
     #import concurrent.futures as cf
     #with cf.ProcessPoolExecutor(max_workers=processes) as executor:
     #  lut = executor.map(function, range(2**27));
-    pool = mp.Pool(mp.cpu_count())
-    lut = pool.map(function, range(2**27), chunksize=2**27//8//mp.cpu_count())
+    pool = mp.Pool(processes)
+    lut = pool.map(function, range(2**27), chunksize=2**27//8//processes)
     pool.close()
     pool.join()
     lut = list(lut)
@@ -347,7 +348,7 @@ def smooth_by_configuration_block(source, iterations = 1, verbose = False):
     The smoothed binary array.
   """
   try:
-    if isinstance(source, io.src.Source):
+    if isinstance(source, source_mod.Source):
       smoothed = source.array
     else:
       smoothed = source
@@ -413,8 +414,8 @@ def smooth_by_configuration(source, sink=None, iterations=1, processing_paramete
   smooth.__name__ = 'smooth_by_configuration'
   
   # initialize sources and sinks
-  source = io.open_ro(source)
-  sink   = io.initialize(sink, shape_=source.shape, dtype_=bool, order_=source.order)
+  source = io_ops.open_ro(source)
+  sink   = source_initialization.initialize(sink, shape_=source.shape, dtype_=bool, order_=source.order)
 
   #block processing parameter
   block_processing_parameter = dict(axes = bp.block_axes(source), 
@@ -467,7 +468,7 @@ def _test():
   
   noisy = binary.copy()
   noisy[np.logical_and(border, np.random.rand(*shape) > 0.925)] = True
-  smoothed  = sm.smooth_by_configuration(noisy, iterations=3, verbose=True, processes='serial')
+  smoothed  = sm.smooth_by_configuration(noisy, iterations=3, verbose=True, processes=0)
   
   import ClearMap.Visualization.Plot3d as p3d
   p3d.plot([noisy, smoothed])

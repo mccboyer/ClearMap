@@ -1,6 +1,9 @@
 from typing import Any, Dict, Iterable, Mapping
 
 from ...Utils.exceptions import AggregatedValidationError
+from ..channel import folded_channel_name
+from ..compound_keys import compound_channel_parts
+from ..registration_channels import ALIGN_WITH_UNDECIDED, ATLAS, REFERENCE_UNDECIDED, REGISTRATION_DIRECTIONS
 
 __all__ = ['run_semantic_checks']
 
@@ -21,13 +24,36 @@ def _channels_in_section(config: Mapping[str, Any], section: str) -> Iterable[st
     return chs.keys()
 
 
+def _validate_channel_names_are_unique_case_insensitive(config: Mapping[str, Any]) -> list[str]:
+    """
+    Channel names become file names, which some file systems fold: ``Fos`` and ``fos`` would be the same files.
+    """
+    names_by_folded_name: dict[str, list[str]] = {}
+    for name in _sample_channels(config):
+        names_by_folded_name.setdefault(folded_channel_name(name), []).append(name)
+    return [f"[sample] channels: names differing only by case: {sorted(names)}"
+            for names in names_by_folded_name.values() if len(names) > 1]
+
+
 def _validate_channels_subset(config: Mapping[str, Any], section: str) -> list[str]:
+    """
+    Every channel of a section must be a sample channel. The key of a compound channel
+    (e.g. ``'cfos-dapi'`` in colocalization) is checked through its parts, which are the sample channels.
+    """
     known = _sample_channels(config)
-    names = set(_channels_in_section(config, section))
-    unknown = sorted(names - known)
+    unknown: set[str] = set()
+    malformed: list[str] = []
+    for name in _channels_in_section(config, section):
+        try:
+            parts = compound_channel_parts(name) or (name,)
+        except (TypeError, ValueError) as err:
+            malformed.append(f"[{section}] channels: invalid channel key {name!r}: {err}")
+            continue
+        unknown.update(part for part in parts if part not in known)
+    errors = malformed
     if unknown:
-        return [f"[{section}] channels: unknown {unknown}; not present in sample.channels"]
-    return []
+        errors.append(f"[{section}] channels: unknown {sorted(unknown)}; not present in sample.channels")
+    return errors
 
 
 def _validate_registration_refs(config: Mapping[str, Any]) -> list[str]:
@@ -35,13 +61,18 @@ def _validate_registration_refs(config: Mapping[str, Any]) -> list[str]:
     known = _sample_channels(config)
     reg = (config.get("registration") or {})
     chs: Dict[str, Any] = (reg.get("channels") or {})
-    tokens_align = {"atlas", "self", "other"}
-    tokens_moving = {"atlas", "intrinsically_aligned", "self", "other"}
+    # self and other are relative to the align_with: only directions (moving_channel)
+    tokens_align_with = {ATLAS, ALIGN_WITH_UNDECIDED}
+    tokens_moving = {ATLAS, *REGISTRATION_DIRECTIONS}
+    reference_channel = reg.get('reference_channel')
+    if (isinstance(reference_channel, str) and reference_channel != REFERENCE_UNDECIDED
+            and reference_channel not in known):
+        errs.append(f"[registration] reference_channel → unknown '{reference_channel}'")
     for ch_name, spec in chs.items():
         spec = spec or {}
         aw = spec.get("align_with")
         mv = spec.get("moving_channel")
-        if isinstance(aw, str) and aw not in tokens_align and aw not in known:
+        if isinstance(aw, str) and aw not in tokens_align_with and aw not in known:
             errs.append(f"[registration] channels.{ch_name}.align_with → unknown '{aw}'")
         if isinstance(mv, str) and mv not in tokens_moving and mv not in known:
             errs.append(f"[registration] channels.{ch_name}.moving_channel → unknown '{mv}'")
@@ -129,6 +160,7 @@ def _validate_machine_cross(config: Mapping[str, Any]) -> list[str]:
 def run_semantic_checks(config: Mapping[str, Any], _sv=None) -> None:
     messages: list[str] = []
     if config.get("sample"):
+        messages.extend(_validate_channel_names_are_unique_case_insensitive(config))
         for sec in SECTIONS_WITH_CHANNELS:
             if config.get(sec):
                 messages.extend(_validate_channels_subset(config, sec))

@@ -3,11 +3,10 @@ import functools
 import traceback
 import warnings
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import List, Any, Callable, Mapping, Optional, Dict, Type, Tuple, Sequence, Union
 
 from PyQt5.QtCore import QEvent, QObject
-from importlib_metadata import version
 from packaging.version import Version
 
 from PyQt5 import sip
@@ -15,20 +14,22 @@ from PyQt5.QtWidgets import (QCheckBox, QLabel, QLineEdit, QSpinBox, QFrame,
                              QComboBox, QPlainTextEdit, QTextEdit, QGroupBox,
                              QWidget, QListWidget, QDoubleSpinBox)
 
+from ClearMap import __version__
 from ClearMap.IO.assets_constants import CONTENT_TYPE_TO_PIPELINE
-from ClearMap.Utils.event_bus import BusSubscriberMixin, EventBus, Publishes
-from ClearMap.Utils.events import ChannelsChanged
-from ClearMap.Utils.utilities import set_item_recursive, get_item_recursive, DELETE
+from ClearMap.Utils.event_bus import BusSubscriberMixin, EventBus, GUI_THREAD
+from ClearMap.config.config_adjusters.dict_ops import set_item_recursive, get_item_recursive
+from ClearMap.config.config_adjusters.patch_ops import DELETE
 from ClearMap.Utils.exceptions import ConfigNotFoundError, ClearMapValueError
 from ClearMap.config.config_handler import ALTERNATIVES_REG
+from ClearMap.gui.exception_handler import handle_exception
 from ClearMap.gui.gui_utils_base import disconnect_widget_signal
 from ClearMap.gui.pipeline_model import LinearPipeline, PipelineStep, BINARIZATION_STEPS
 from ClearMap.gui.pipeline_widgets import LinearPipelineWidget
 from ClearMap.gui.widget_monkeypatch_callbacks import _get_sorted_spin_boxes, ensure_compound_box_patched
-from ClearMap.gui.widgets import ExtendableTabWidget, FileDropListWidget, LandmarksWeightsPanel, GroupsWidgetAdapter, \
-    NProcessesWidget
+from ClearMap.gui.widgets import (ExtendableTabWidget, FileDropListWidget, channel_page_id_of, LandmarksWeightsPanel, GroupsWidgetAdapter,
+                                  NProcessesWidget)
 
-CLEARMAP_VERSION = Version(version('ClearMap'))
+CLEARMAP_VERSION = Version(__version__)
 DEBUG_PAINT_GUARD = True   # FIXME: base on machine params log_level
 
 _UNSET = object()  # sentinel singleton
@@ -84,6 +85,10 @@ class ParamLink:
         The list of keys to access the value in the config file
         If None, the attribute is not present in the config file and
         will not be connected
+    section_level: bool
+        If True, the keys are relative to the section (i.e. the config file, the first key of the
+        cfg_subtree of the parameter) rather than to the cfg_subtree. For values which are shared by
+        all the instances of a parameter (e.g. the performance of a section, shown on the page of each channel).
     _widget: QWidget
         The GUI widget to be connected to the config file
     object_name: str
@@ -109,12 +114,14 @@ class ParamLink:
                  extra_connect: Optional[Callable[[QWidget, Callable[[], None]], Callable | None]] = None,
                  missing_ok: bool = False,
                  present_if: Optional[Callable[[dict], bool]] = None,
-                 disabled_value: Any =None, ui_sentinel: Any =None, enforce_sentinel_min=False,):
+                 disabled_value: Any =None, ui_sentinel: Any =None, enforce_sentinel_min=False,
+                 section_level: bool = False):
         if isinstance(widget, QFrame):
             ensure_compound_box_patched(widget)
         if keys is None:
             connect = False
         self.keys: List[str] = keys
+        self.section_level: bool = section_level  # keys are relative to the section, not to the cfg_subtree
         self._widget: QWidget = widget
         self._had_widget: bool = widget is not None  # intentionally None vs later-stale
 
@@ -975,6 +982,8 @@ class UiParameter(BusSubscriberMixin):
         The list of keys to access the config file. This allows a relative path to be used from the
         whole config file.
     """
+    subscriber_affinity = GUI_THREAD  # The handlers touch widgets
+
     def __init__(self, tab: QWidget, *, event_bus: EventBus,
                  get_view: Optional[Callable[[], Mapping[str, Any]]] = None,
                  apply_patch: Optional[Callable[[dict], None]] = None):
@@ -1077,8 +1086,22 @@ class UiParameter(BusSubscriberMixin):
         base = self._get_view()
         return get_item_recursive(base, self.cfg_subtree) if self.cfg_subtree else base
 
-    def _emit_patch(self, relative_path, value) -> None:
-        full_path = list(self.cfg_subtree) + list(relative_path)
+    @property
+    def section_subtree(self) -> List[str]:
+        """The path of the section (the config file) which holds the cfg_subtree (the first key, if any)"""
+        return list(self.cfg_subtree[:1])
+
+    @property
+    def section_view(self):
+        """The view of the whole section, for the links with section level keys"""
+        if self._get_view is None:
+            raise ValueError('View provider not set. Please call bind_view_provider first.')
+        base = self._get_view()
+        return get_item_recursive(base, self.section_subtree) if self.section_subtree else base
+
+    def _emit_patch(self, relative_path, value, *, section_level=False) -> None:
+        prefix = self.section_subtree if section_level else list(self.cfg_subtree)
+        full_path = prefix + list(relative_path)
         patch = {}
         set_item_recursive(patch, full_path, value)
         if self._apply_patch is not None:
@@ -1170,7 +1193,7 @@ class UiParameter(BusSubscriberMixin):
         if not param_link.is_relevant(self.view):
             return
         property_value = getattr(self, attr_name)  # Cast happens here, don't do it twice
-        self._emit_patch(keys, property_value)
+        self._emit_patch(keys, property_value, section_level=param_link.section_level)
         if callable(param_link.notify_apply):
             param_link.notify_apply()
 
@@ -1201,7 +1224,9 @@ class UiParameter(BusSubscriberMixin):
                     if not relevant:
                         continue
                 try:
-                    val = get_item_recursive(view, keys_list)  # check if we want try_get_item here w/ default
+                    section_level = isinstance(p_link, ParamLink) and p_link.section_level
+                    val = get_item_recursive(self.section_view if section_level else view,
+                                             keys_list)  # check if we want try_get_item here w/ default
                 except (KeyError, ConfigNotFoundError):
                     if isinstance(p_link, ParamLink) and p_link.missing_ok:
                         val = p_link.default
@@ -1278,23 +1303,55 @@ class ChannelUiParameter(UiParameter, ABC):
     """
     Base class for channel parameters. Each channel parameter is associated with a channel name
     and a widget in the tab.
+
+    It is the params of ONE channel page of a tab (one tab of its ``channelsParamsTabWidget``), linked to that
+    channel's entry of the config section (``cfg_subtree``). The "channel" of a page is either:
+
+    - a channel of the sample (e.g. ``'fos'``), or
+    - a compound channel (e.g. the colocalization pair ``'fos-dapi'``), which has no id of its own in the registry.
+
+    Either way the page holds one :class:`ClearMap.gui.widgets.ChannelPageId` and the params find their page by
+    it, never by its tab text or index, which a rename or a removal moves. The name is the config key; only a
+    rename changes it.
+
+    Instances are made and held by the :class:`ChannelsUiParameterCollection` of the tab (its ``add_channel``).
+    A page whose params need several sections is a :class:`UiParameterCollection` of these instead
+    (e.g. ``ChannelStitchingParams``: shared, rigid and wobbly).
     """
     def __init__(self, tab: QWidget, channel_name: str, *, event_bus: EventBus,
                  name_widget_name: Optional[str] = None,
                  get_view: Callable[[], Mapping[str, Any]] | None = None,
                  apply_patch: Callable[[dict], None] | None = None):
         tab_widget = tab.channelsParamsTabWidget
-        page, self.page_index = tab_widget.get_channel_widget(channel_name, return_idx=True)
+        page, _ = tab_widget.get_channel_widget(channel_name, return_idx=True)
         if page is None:
             raise ClearMapValueError(f'Channel {channel_name} not found in tab for {self.__class__.__name__}. '
                                      f'Please add it first.')
+        page_id = channel_page_id_of(page)  # The page holds the id of its channel: the one place which says which page
+        if page_id is None:
+            raise ClearMapValueError(f'The page of channel {channel_name} has no channel id: it was not made from the '
+                                     f'registry of the sample. Add the channel through the sample manager first.')
+        self._tab_widget = tab_widget
+        self._page_id = page_id  # Not the page nor its index: both move, the id does not
+        self._channel_name = channel_name  # The channel of the page. Only a rename changes it (see the name setter)
         if name_widget_name is not None:
             self.nameWidget = getattr(page, name_widget_name)
             self.nameWidget.setText(channel_name)  # WARNING: needs to come first since used by all the rest
-            # self.name = channel_name  # WARNING: needs to come first since used by all the rest
         else:
             self.nameWidget = tab_widget
         super().__init__(page, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
+
+    @property
+    def page(self):
+        """The page of this channel, found by its id now (None once the channel has no page)"""
+        page, _ = self._tab_widget.get_channel_widget_by_page_id(self._page_id, return_idx=True)
+        return page
+
+    @property
+    def page_index(self) -> int:
+        """The index of the page of this channel in the tab widget, found by its id now (-1 if there is none)"""
+        _, index = self._tab_widget.get_channel_widget_by_page_id(self._page_id, return_idx=True)
+        return index
 
     @property
     @abstractmethod
@@ -1308,21 +1365,27 @@ class ChannelUiParameter(UiParameter, ABC):
 
     @property
     def name(self):
-        if isinstance(self.nameWidget, QLineEdit):
-            return self.nameWidget.text()
-        elif isinstance(self.nameWidget, ExtendableTabWidget):
-            return self.nameWidget.tabText(self.page_index)
-        else:
-            raise ValueError(f'Unsupported nameWidget type: {type(self.nameWidget)}')
+        """
+        The channel of this page. It is the name the config knows it by: it is not read from a widget, since the text
+        typed in a name field is not a rename until it is committed, and the tab text can be another page's.
+        """
+        return self._channel_name
 
     @name.setter
     def name(self, value):
-        if value == self.name:
-            return
+        """Set by the rename (and its revert) only: the config is written by the caller, before this is called"""
+        self._channel_name = value
+        self.show_name()
+
+    def show_name(self):
+        """Show the name of the channel in its name field (which may hold text typed over it) and on its tab"""
         if isinstance(self.nameWidget, QLineEdit):
-            self.nameWidget.setText(value)
-        elif isinstance(self.nameWidget, ExtendableTabWidget):
-            self.nameWidget.setTabText(self.page_index, value)
+            self.nameWidget.blockSignals(True)  # Showing the name is not an edit to commit
+            self.nameWidget.setText(self._channel_name)
+            self.nameWidget.blockSignals(False)
+        index = self.page_index
+        if index != -1:
+            self._tab_widget.setTabText(index, self._channel_name)
 
 
 class UiParameterCollection(BusSubscriberMixin, ABC):
@@ -1331,7 +1394,19 @@ class UiParameterCollection(BusSubscriberMixin, ABC):
     This ensures the file remains consistent.
     Although the attributes of contained `UiParameters` are accessible,
     it is recommended to first dereference them to avoid clashes.
+
+    It is used at two levels:
+
+    - the params of a whole tab with channel pages: :class:`ChannelsUiParameterCollection`;
+    - the params of ONE channel page made of several sections (e.g. ``ChannelStitchingParams``), stored in the
+      tab's collection like a :class:`ChannelUiParameter` ("collection of collections").
+
+    In the second case it stands in for a ChannelUiParameter, so it must answer what the tab asks of a page's
+    params: ``cfg_to_ui``, ``teardown``, ``_suppress_handlers``... Each is forwarded to its sub-params
+    (``params``).
     """
+    subscriber_affinity = GUI_THREAD  # The handlers touch widgets
+
     def __init__(self, tab: QWidget, *, pipeline_name: str, event_bus: EventBus,
                  get_view: Callable[[], Mapping[str, Any]] | None = None,
                  apply_patch: Callable[[dict], None] | None = None):
@@ -1380,7 +1455,45 @@ class UiParameterCollection(BusSubscriberMixin, ABC):
         if self._apply_patch is not None:
             self._apply_patch(patch)
 
+    def drop_channel(self, channel_name):  # FIXME: should be in ChannelsUiParameterCollection. Check calls
+        """
+        Remove the page and the params of a channel from the view. **Does not write the config**: the config is
+        the source of truth, this is for the view to follow it (see ExperimentTab.reconcile_channel_pages).
+        Does nothing if the channel has no params.
+
+        Returns
+        -------
+        The params of the channel that were removed, None if there were none.
+        """
+        popped_channel = self.channel_params.pop(channel_name, None)
+
+        # remove the channel's page from the tab widget if it exists
+        tab_widget = getattr(self.tab, 'channelsParamsTabWidget', None)
+        if tab_widget is not None:
+            tab_widget.remove_channel_widget(channel_name)
+
+        # Disconnect the signals of the params and free their resources
+        if popped_channel is not None:
+            try:
+                popped_channel.teardown()  # Disconnect all signals and free resources
+            except Exception as e:
+                warnings.warn(f'Error during teardown of channel "{channel_name}": {e}')
+        return popped_channel
+
     def pop(self, channel_name):  # FIXME: should be in ChannelsUiParameterCollection. Check calls
+        """
+        The user removes a channel: remove its page, then ask the config to remove it.
+
+        .. important::
+            The page goes first, so that the commit cannot reach the params of a channel which is gone.
+            The other tabs drop their page of the channel when they follow the config.
+
+        Returns
+        -------
+        The params of the channel that were removed. None if there were none or if the config refused the removal,
+        which is then told to the user: the channel is still in the config, so the tab has to make its page again
+        (see SampleInfoTab.remove_channel).
+        """
         if self._apply_patch is None:
             raise ValueError('Patch sink not set. Please call bind_apply_patch first.')
         if not self.channels:
@@ -1389,38 +1502,13 @@ class UiParameterCollection(BusSubscriberMixin, ABC):
             warnings.warn(f'Could not remove "{channel_name=}" not found in {self.channels=}')
             return None
 
-        channels_before = self.channels[:]
-
-        # 1. Remove from in-memory dict FIRST (prevents re-entrant KeyError)
-        popped_channel = self.channel_params.pop(channel_name)
-
-        # 2. Remove UI widget BEFORE firing events (so reconcile_channel_pages
-        #    won't see it as obsolete and try to pop again)
-        tab_widget = getattr(self.tab, 'channelsParamsTabWidget', None)
-        if tab_widget is not None:
-            tab_widget.remove_channel_widget(channel_name)
-
-        # 3. Notify config (may fire synchronous ChannelsChanged — now harmless)
+        # View goes first, then config. This is to avoid the config being updated while the view is still there.
+        popped_channel = self.drop_channel(channel_name)
         try:
             self._emit_patch(['channels', channel_name], DELETE)
-        except Exception as e:
-            warnings.warn(f'Could not remove "{channel_name=}" from config: {e}')
+        except Exception as err:
+            handle_exception(err, parent=self.tab, context=f'Remove {channel_name!r}')
             return None
-
-        # popped_channel = self.channel_params.pop(channel_name)
-
-        # 4. Ensure all signals get disconnected and resources freed
-        try:
-            popped_channel.teardown()
-        except Exception as e:
-            warnings.warn(f'Error during teardown of channel "{channel_name}": {e}')
-
-        tab = self.tab.channelsParamsTabWidget
-        tab.remove_channel_widget(channel_name)
-
-        # 5. Bus notification
-        channels_after = self.channels
-        self.publish(ChannelsChanged(before=channels_before, after=channels_after))
         return popped_channel
 
     @property
@@ -1445,10 +1533,27 @@ class UiParameterCollection(BusSubscriberMixin, ABC):
         for param in self.params:
             param._painting = painting
 
+    @contextmanager
+    def _suppress_handlers(self):
+        """Suppress the handlers of every sub-params (as ``UiParameter._suppress_handlers`` does for a single one)"""
+        with ExitStack() as stack:
+            for param in self.params:
+                if param is not None:
+                    stack.enter_context(param._suppress_handlers())
+            yield
+
 
 class ChannelsUiParameterCollection(UiParameterCollection):
-    publishes = Publishes(ChannelsChanged)
+    """
+    The params of a tab with channel pages: one entry per page, keyed by the name of the page's channel (a channel
+    of the sample, or a compound channel such as a colocalization pair, see :class:`ChannelUiParameter`).
 
+    It is not a container for the parts of a compound channel: a pair is one page, one entry, like any channel.
+    Each subclass's ``add_channel`` decides which params a page gets (a :class:`ChannelUiParameter`, or a
+    :class:`UiParameterCollection` for a page made of several sections). The pages follow the config
+    (``ExperimentTab.reconcile_channel_pages``): ``drop_channel`` removes a page without writing the config,
+    ``pop`` is the user removing a channel.
+    """
     def __init__(self, tab: QWidget, *, pipeline_name: str, event_bus: EventBus,
                  get_view: Callable[[], Mapping[str, Any]] | None = None,
                  apply_patch: Callable[[dict], None] | None = None):

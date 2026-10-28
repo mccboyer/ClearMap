@@ -12,9 +12,9 @@ with the @adjuster decorator
 from copy import deepcopy
 from typing import Any, Optional, Iterable, Dict, Sequence, List, Set, Tuple
 
-from ClearMap.Utils.utilities import deep_merge, REPLACE, DELETE, _REPLACE
-
-from ClearMap.config.compound_keys import CompoundKey
+from ClearMap.config.channel import is_reserved_channel_name
+from ClearMap.config.registration_channels import RegistrationState, registration_changes_to_follow_defaults
+from ClearMap.config.compound_keys import CompoundKey, compound_is_oriented
 
 from ClearMap.config.config_handler import ALTERNATIVES_REG
 from ClearMap.config.config_adjusters.type_hints import (ConfigView, ConfigPatch, SampleManagerProtocol, KeysPath,
@@ -25,7 +25,8 @@ from ClearMap.config.config_adjusters.patch_ops import (_strip_template_like_key
                                                         _stable_order_keys,
                                                         _restrict_entry_to_template_keys,
                                                         _strip_template_like_keys_from_entry, merge_patches,
-                                                        _raise_if_rename_map_collides, set_patch_at_path)
+                                                        _raise_if_rename_map_collides, set_patch_at_path,
+                                                        deep_merge, REPLACE, DELETE, _REPLACE)
 from ClearMap.config.config_adjusters.templates_resolver import get_current_resolver
 from ClearMap.config.config_adjusters.adjusters_api import Phase, Step, patch_adjuster, AdjusterKind
 from ClearMap.config.config_adjusters.policy_specs import (InstanceContainerSpec,
@@ -100,9 +101,10 @@ INSTANCE_SPECS: tuple[InstanceContainerSpec, ...] = (
         container_path='.channels',
         defaults_templates_path='.templates',
         template_kind=TemplateKind.PAIRS,
-        membership=Membership(source='sample', instance_kind='pairs', oriented=True),
+        membership=Membership(source='sample', instance_kind='pairs',
+                              oriented=compound_is_oriented('Colocalization')),
         compound=True,
-        compound_oriented=True,
+        compound_oriented=compound_is_oriented('Colocalization'),
         reconcile=ReconcileStepSpec(
             applies=True,
             kind=ReconcileKind.GENERIC,
@@ -143,7 +145,7 @@ STATIC_OWNED_KEYS = tuple((s,) for s in STATIC_SECTIONS)
 # ############ Global rename triggered by SampleManager ############
 @patch_adjuster(step=Step.APPLY_RENAMES, phase=Phase.PRE_VALIDATE, requires_sample_manager=True,
                 watched_keys=None, kind=AdjusterKind.INSTANCE_OWNER,
-                owned_keys=RENAME_KEYS)
+                owned_keys=RENAME_KEYS + (('registration', 'reference_channel'),))
 def apply_channel_renames(view: ConfigView, ctx: AdjustmentContext) -> ConfigPatch:
     """
     Rename section channels
@@ -193,6 +195,9 @@ def apply_channel_renames(view: ConfigView, ctx: AdjustmentContext) -> ConfigPat
 
     # 2. Values: fix back-references to old channel names
     _fix_channel_backreferences(view, rename_map, patch)
+    reference_channel = (view.get('registration') or {}).get('reference_channel')
+    if not is_reserved_channel_name(reference_channel) and reference_channel in rename_map:
+        patch.setdefault('registration', {})['reference_channel'] = rename_map[reference_channel]
 
     return patch
 
@@ -217,6 +222,8 @@ def _fix_channel_backreferences(view: ConfigView, rename_map: dict[str, str],
                 continue
             for field in fields:
                 val = ch_cfg.get(field)
+                if is_reserved_channel_name(val):  # Not a channel (e.g. moving_channel: other): never renamed
+                    continue
                 if val in rename_map:
                     ch_cfg[field] = rename_map[val]
 
@@ -580,6 +587,47 @@ def reconcile_generic_instance_containers(view: ConfigView, ctx: AdjustmentConte
             merge_patches(patch, p)
 
     return patch
+
+@patch_adjuster(step=Step.ADJUST, phase=Phase.PRE_VALIDATE, requires_sample_manager=True,
+                watched_keys=(('sample', 'channels'), ('registration', 'reference_channel')),
+                owned_keys=(('registration', 'channels'), ('registration', 'reference_channel')),
+                kind=AdjusterKind.OTHER)
+def update_unedited_registration_channels(view: ConfigView, ctx: AdjustmentContext) -> ConfigPatch:
+    """
+    The reference channel and the registrations which are still defaults follow the data types and the reference
+    channel as the user sets them (see registration_changes_to_follow_defaults).
+    """
+    if view.get('registration') is None:  # A sample without registration (yet)
+        return {}
+    sm = ctx.sample_manager
+    now = RegistrationState(view['registration'], {channel: sm.data_type(channel) for channel in sm.channels})
+    before = _registration_state_before_patch(ctx.view_before_patch, sm.renamed_channels or {})
+    changes = registration_changes_to_follow_defaults(now, before)
+    return {'registration': changes} if changes else {}
+
+
+def _registration_state_before_patch(view_before_patch: Optional[ConfigView],
+                                     renames: dict[str, str]) -> Optional[RegistrationState]:
+    """
+    The registration as it was before the patch, under the names of the channels after it: the renames of the patch
+    applied to the channel keys and to the reference channel, so that it compares with the config now.
+    None when there is no config of before (it is loaded, not changed).
+    """
+    if view_before_patch is None or view_before_patch.get('registration') is None:
+        return None
+
+    def renamed(channel):
+        return renames.get(channel, channel)
+
+    config = dict(view_before_patch['registration'])
+    config['channels'] = {renamed(channel): channel_config
+                          for channel, channel_config in (config.get('channels') or {}).items()}
+    if 'reference_channel' in config:
+        config['reference_channel'] = renamed(config['reference_channel'])
+    data_types = {renamed(channel): channel_config.get('data_type', 'undefined')
+                  for channel, channel_config in view_before_patch['sample']['channels'].items()}
+    return RegistrationState(config, data_types)
+
 
 ########################## TEMPLATES CLEANUP ##############
 TEMPLATE_ROOT_KEYS = tuple(spec.abs_templates_path() for spec in INSTANCE_SPECS_REGISTRY.specs

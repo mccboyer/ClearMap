@@ -18,19 +18,21 @@ __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 import os
 import shutil
 import importlib
+import uuid
+from dataclasses import dataclass
+from typing import Iterable
 
 __all__ = ['is_file', 'is_directory', 'file_extension', 'join', 'split',
            'abspath', 'create_directory', 'delete_directory',
-           'copy_file', 'delete_file']
+           'copy_file', 'delete_file', 'Rename', 'FileRenameError', 'check_renames', 'apply_renames']
 
 import warnings
 
 from pathlib import Path
 
-from ClearMap.Utils.exceptions import ClearMapFileNotFoundError, ClearMapIoException
-
-# FIXME: not clean but cannot import IO to avoid circular import. Should be from Source attributes ?
-SOURCE_EXTENSIONS = ['npy', 'tif', 'tiff', 'nrrd', 'nrdh', 'csv', 'mhd', 'gt']
+from ClearMap.IO.source.backends import registry
+from ClearMap.Utils.exceptions import ClearMapFileNotFoundError, ClearMapIoException, ClearMapValueError, Severity
+from ClearMap.Utils.tag_expression import Expression
 
 ##############################################################################
 # ## Basic file queries
@@ -231,8 +233,7 @@ def delete_file(filename):
     filename : str | Path
         Filename to delete.
     """
-    if isinstance(filename, Path):
-        filename = str(filename)
+    filename = normalize_location_spec(filename)
     if is_file(filename):
         os.remove(filename)
 
@@ -377,6 +378,44 @@ def atomic_replace(tmp: Path, dst: Path) -> None:
     os.replace(tmp, dst)
 
 
+def atomic_write(write, location, *args, **kwargs) -> None:
+    """Write a file atomically, so a crash mid-write never destroys the previous file.
+
+    ``write(tmp_path)`` must produce the complete file at ``tmp_path``, which is then
+    moved onto *location* with :func:`atomic_replace`. The temporary file sits in the
+    same directory (so the move is atomic) and keeps the full original file name as
+    its suffix, since some writers pick the format from the extension (e.g. ``.gt``
+    vs ``.gt.gz``). It is removed if writing fails.
+
+    Parameters
+    ----------
+    write : callable
+        Called as ``write(tmp_path, *args, **kwargs)``, with the temporary path as a ``str``.
+    location : str or Path
+        The final file.
+    *args, **kwargs
+        Forwarded to `write` (e.g. ``atomic_write(io_ops.write, path, data)``).
+    """
+    location = Path(location)
+    location.parent.mkdir(parents=True, exist_ok=True)
+    tmp = location.with_name(f'.tmp-{os.getpid()}-{location.name}')
+    try:
+        write(str(tmp), *args, **kwargs)
+        atomic_replace(tmp, location)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_bytes(data: bytes, location) -> None:
+    """Write `data` to `location` atomically (see atomic_write)."""
+    atomic_write(_write_bytes, location, data)
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    Path(path).write_bytes(data)
+
+
 def uncompress(file_path, extension='zip', check=True, verbose=False):
     """
     Unzips a file only if:
@@ -433,9 +472,10 @@ def uncompress(file_path, extension='zip', check=True, verbose=False):
                     return
             elif extension in ('bz2', 'gzip', 'lzma'):
                 mod = importlib.import_module(extension)
-                with open(file_path, 'wb') as out, \
-                        open(compressed_path, 'rb') as compressed_file:
-                    out.write(mod.decompress(compressed_file.read()))
+                with open(compressed_path, 'rb') as compressed_file:
+                    data = mod.decompress(compressed_file.read())
+                # Atomic: never leave a truncated file
+                atomic_write_bytes(data, file_path)
             else:
                 raise NotImplementedError(f'Unrecognized compression extension {extension}')
         else:
@@ -567,27 +607,190 @@ def check_extensions(extensions):
     """
     for ext in extensions:
         if not ext.startswith('.'):
-            raise ValueError(f'Extension "{ext}" should start with a dot.')
-        if not is_clearmap_source_extension(ext):
-            raise ValueError(f'Unknown extension "{ext}". '
-                             f'Supported extensions are "{SOURCE_EXTENSIONS}".')
+            raise ClearMapValueError(f'Extension "{ext}" should start with a dot.')
+        if not registry.supports_extension(ext):
+            raise ClearMapValueError(f'Unknown extension "{ext}". Supported extensions are "{registry.SOURCE_EXTENSIONS}".')
 
 
-def is_clearmap_source_extension(extension):
+def normalize_location_spec(location)-> str | Expression | None:
+    """Normalise representation without interpreting location semantics.
+
+    Path-like and byte representations are converted to text.
+    Tag Expression objects retain their semantic type.
+    Strings are returned unchanged, including strings containing tag
+    expressions such as ``tile_<X,2>.tif``.
     """
-    Check if the extension is supported by ClearMap IO.
+    if location is None:
+        return None
 
-    Parameters
-    ----------
-    extension: str
-        The extension to check.
+    if isinstance(location, Expression):  # strings representing expressions remain strings
+        return location
+
+    if isinstance(location, os.PathLike):
+        location = os.fspath(location)
+
+    if isinstance(location, bytes):
+        location = os.fsdecode(location)
+
+    if not isinstance(location, str):  # FIXME: more ClearMapTypeError probably
+        raise ClearMapIoException(f'Expected str, bytes, os.PathLike, Expression or None; got {type(location).__name__}')
+
+    return location
+    
+
+###############################################################################
+# ## Renaming
+###############################################################################
+
+# A batch of files and folders is renamed as a whole: checked before anything moves, moved in two steps (so swaps
+# and case-only renames work, also on case-insensitive file systems) and moved back if one of the renames fails.
+
+
+@dataclass(frozen=True)
+class Rename:
+    """A file or folder to move to another name (in the same folder or in another one)"""
+    source: Path
+    target: Path
+
+    def __post_init__(self):
+        object.__setattr__(self, 'source', Path(self.source))
+        object.__setattr__(self, 'target', Path(self.target))
+
+    @property
+    def is_no_op(self) -> bool:
+        return self.source == self.target
+
+
+class FileRenameError(ClearMapIoException):
+    """A batch of renames is refused (nothing moved), or failed (what moved was put back, if possible)"""
+    severity = Severity.RECOVERABLE
+    user_title = 'Files Cannot Be Renamed'
+    user_hint = 'Move or rename the files in the way, then try again.'
+
+
+def _key(path: Path) -> str:
+    """How paths are compared for collisions: whatever the case, so the plan is the same on every platform"""
+    return os.path.normcase(str(path)).casefold()
+
+
+def check_renames(renames: Iterable[Rename]) -> list[Rename]:
+    """
+    Check that the batch can be applied as a whole, without touching the disk.
 
     Returns
     -------
-    bool
+    list[Rename]
+        The renames to apply, in the same order (the ones which change nothing are left out).
+
+    Raises
+    ------
+    FileRenameError
+        If a source is missing or used twice, if two renames have the same target, or if a target exists and
+        is not itself moved away by the batch.
     """
-    return extension.lstrip('.') in SOURCE_EXTENSIONS
-    
+    renames = [rename for rename in renames if not rename.is_no_op]
+
+    sources = [_key(rename.source) for rename in renames]
+    if len(set(sources)) != len(sources):
+        raise FileRenameError(f'Several renames start from the same path: {_duplicates(sources)}')
+    targets = [_key(rename.target) for rename in renames]
+    if len(set(targets)) != len(targets):
+        raise FileRenameError(f'Several renames end at the same path: {_duplicates(targets)}')
+
+    missing = [rename.source for rename in renames if not rename.source.exists()]
+    if missing:
+        raise FileRenameError(f'Cannot rename what does not exist: {", ".join(map(str, missing))}')
+
+    moved_away = set(sources)
+    in_the_way = [rename.target for rename in renames
+                  if rename.target.exists() and _key(rename.target) not in moved_away
+                  and not _is_same_file(rename.source, rename.target)]
+    if in_the_way:
+        raise FileRenameError(f'Cannot rename onto what exists: {", ".join(map(str, in_the_way))}')
+    return renames
+
+
+def apply_renames(renames: Iterable[Rename]) -> list[Rename]:
+    """
+    Apply the batch: check it, move every source to a temporary name, then every temporary name to its target.
+    What is inside a renamed folder (and renamed too) moves first, so give its path as it is before the folder
+    moves. If a move fails, everything which moved is put back.
+
+    Returns
+    -------
+    list[Rename]
+        The renames which were applied.
+
+    Raises
+    ------
+    FileRenameError
+        If the batch is refused (nothing moved) or one of the moves failed (see :func:`check_renames`).
+    """
+    renames = check_renames(renames)
+    done: list[tuple[Path, Path]] = []  # (from, to) of every move, to put them back in reverse
+    temporary = {rename: _temporary_path(rename.source) for rename in renames}
+    try:
+        for same_depth_renames in _by_nesting_depth_innermost_first(renames):  # What is inside a folder moves first
+            for rename in same_depth_renames:
+                _move(rename.source, temporary[rename], done)
+            for rename in same_depth_renames:
+                rename.target.parent.mkdir(parents=True, exist_ok=True)
+                _move(temporary[rename], rename.target, done)
+    except Exception as err:
+        stuck = _put_back(done)
+        message = f'Renaming failed ({err}); the files were put back.'
+        if stuck:
+            message = (f'Renaming failed ({err}) and could not put everything back: '
+                       f'{", ".join(f"{path} (was {origin})" for path, origin in stuck)}.')
+        raise FileRenameError(message) from err
+    return renames
+
+
+def _by_nesting_depth_innermost_first(renames: list[Rename]) -> list[list[Rename]]:
+    """
+    The renames in groups of the same nesting depth, the most nested group first.
+
+    The nesting depth of a rename is the number of other renames whose source holds its source (the landmarks file
+    of a registration folder which is renamed too: 1). The renames of a group hold none of each other, so they move
+    together, and what is inside a folder moves before the folder does.
+    """
+    sources = {rename.source for rename in renames}
+    nesting_depths = {rename: len(sources.intersection(rename.source.parents)) for rename in renames}
+    return [[rename for rename in renames if nesting_depths[rename] == depth]
+            for depth in sorted(set(nesting_depths.values()), reverse=True)]
+
+
+def _move(source: Path, target: Path, done: list[tuple[Path, Path]]) -> None:
+    source.rename(target)
+    done.append((source, target))
+
+
+def _put_back(done: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+    """Undo the moves in reverse. Returns the (path, origin) of what could not be put back"""
+    stuck = []
+    for source, target in reversed(done):
+        try:
+            target.rename(source)
+        except OSError:
+            stuck.append((target, source))
+    return stuck
+
+
+def _temporary_path(path: Path) -> Path:
+    return path.with_name(f'.{path.name}.renaming-{uuid.uuid4().hex}')
+
+
+def _is_same_file(source: Path, target: Path) -> bool:
+    """Whether target is source under another spelling (e.g. the case on a case-insensitive file system)"""
+    try:
+        return source.samefile(target)
+    except OSError:
+        return False
+
+
+def _duplicates(keys: list[str]) -> str:
+    return ', '.join(sorted({key for key in keys if keys.count(key) > 1}))
+
 
 ###############################################################################
 # ## Tests

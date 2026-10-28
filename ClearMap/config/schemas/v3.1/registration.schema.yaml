@@ -16,6 +16,13 @@ properties:
       align_files_folder: { type: string }
     additionalProperties: true
 
+  # The channel aligned with the atlas, which the others are aligned with by default
+  reference_channel:
+    anyOf:
+      - { $ref: "./typedefs.schema.yaml#/$defs/channelName" }
+      - { type: "string", const: "__UNDECIDED__" }  # REFERENCE_UNDECIDED: not chosen yet, to choose
+      - { type: "null" }  # NO_REFERENCE: no channel is aligned with the atlas
+
   channels:
     type: object
     # channel keys must match channelName
@@ -37,6 +44,7 @@ properties:
           anyOf:
             - { $ref: "./typedefs.schema.yaml#/$defs/channelName" }
             - { type: "string", const: "atlas" }
+            - { type: "string", const: "__UNDECIDED__" }  # ALIGN_WITH_UNDECIDED: not chosen yet, to choose
             - { type: "null" }
 
         # may be "intrinsically_aligned" or another channel (or null)
@@ -50,7 +58,7 @@ properties:
           type: ["array"]
           items: { type: "string" }
 
-        landmarks_weights:
+        landmarks_weights:  # Per params file, in percent (0: no landmarks), see elastix_landmarks_weight
           type: ["array"]
           items: { type: "number" }
 

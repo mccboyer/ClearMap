@@ -11,22 +11,22 @@ from scipy import stats
 # import mpld3  # WARNING: local import. Present here only for reference
 # from PyQt5.QtWidgets import QApplication
 
-from ClearMap.IO  import IO as clm_io
+from ClearMap.IO import io_ops
 from ClearMap.Analysis.Statistics.group_statistics import (generate_summary_table, group_region_counts,
                                                            remove_p_val_nans, stack_voxelizations, get_colored_p_vals)
 
-from .generic_orchestrators import GroupOrchestratorBase
+from .generic_orchestrators import GroupOrchestratorBase, register_compound_channel, representative_channel
 from .utils import init_sample_manager_and_processors
 from ..Alignment.utils import get_all_region_ids
 from ..Analysis.Statistics.group_assets import GroupResultsAssets
 from ..IO.assets_constants import CHANNELS_ASSETS_TYPES_CONFIG
-from ..Utils.exceptions import GroupStatsError
-from ..Visualization.Qt.Plot3d import PlotPanel, multi_plot_from_panels
+from ..Utils.exceptions import GroupStatsError, MissingRequirementException
 from ..config.atlas import ATLAS_NAMES_MAP
 from ..config.compound_keys import CompoundKey
 
 if TYPE_CHECKING:
     from ClearMap.IO.workspace_asset import Asset
+    from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
     from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 Pair = Tuple[str, str]
@@ -97,16 +97,28 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
                 f'{self._points_asset_type()} for {channel=} has no "id" column. '
                 f'Ensure registration and annotation were run.')
 
+    @staticmethod
+    def _density(sample_manager: 'SampleManager', channel, suffix: str | None, *, pipeline: str,
+                 **kwargs) -> 'Asset':
+        """
+        The density asset of channel, sub-type suffix (which may be dynamic), in the sample's workspace.
+
+        A compound channel (a tuple, e.g. the TubeMap channels or a Colocalization pair) is registered
+        in a workspace by the setup of the processors of its pipeline, which the group analysis does not
+        run for its samples: register it here, for the pipeline that produced the density.
+        """
+        if isinstance(channel, tuple):
+            channel = register_compound_channel(sample_manager, pipeline, channel)
+        return sample_manager.get('density', channel=channel, suffix=suffix, **kwargs)
+
     def _density_asset(self, sample_dir: Path, channel: str, suffix: str) -> 'Asset':
-        sm = self.get_sample_manager_for(sample_dir)
-        asset = sm.get('density', channel=channel, asset_sub_type=suffix or None)
-        return asset
+        return self._density(self.get_sample_manager_for(sample_dir), channel, suffix, pipeline=self.pipeline)
 
     def _density_array(self, sample_dir: Path, channel: str, suffix: str) -> np.ndarray:
         asset = self._density_asset(sample_dir, channel, suffix)
         if not asset.exists:
             raise FileNotFoundError(f'No density for {channel=}, {suffix=} in {sample_dir}')
-        return clm_io.read(asset.path)
+        return asset.read()
 
     def _points_asset_type(self) -> str:
         asset = _PIPELINE_POINTS_ASSET.get(self.pipeline)
@@ -217,13 +229,23 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
                 self.assets.write_effect_size(effect_size, channel, gp1_name, gp2_name, suffix)
         # FIXME: return dict {channel_name: colored_p_vals}
 
-    def find_available_density_suffixes(self) -> List[str]:
-        """Scan the first sample's workspace to find available density suffixes."""
-        if not self.groups:
-            return []
-        first_group = next(iter(self.groups.values()), None)
+    def _first_sample_dir(self, groups: Optional[Dict[str, List[str]]] = None) -> Optional[Path]:
+        """
+        The first sample of the first group that has one, or None.
 
-        sm = self.get_sample_manager_for(Path(first_group[0]))
+        groups: the groups to look in, e.g. the ones the user is editing, which are not in the config
+        until they are applied. By default, the ones of the group controller (the config).
+        """
+        groups = self.groups if groups is None else groups
+        return next((Path(folders[0]) for folders in groups.values() if folders), None)
+
+    def find_available_density_suffixes(self, groups: Optional[Dict[str, List[str]]] = None) -> List[str]:
+        """Scan the first sample's workspace to find available density suffixes (see _first_sample_dir)."""
+        first_sample = self._first_sample_dir(groups)
+        if first_sample is None:
+            return []
+
+        sm = self.get_sample_manager_for(first_sample)
 
         # Get target channel(s) depending on the pipeline
         channels = sm.get_channels_by_pipeline(self.pipeline, as_list=True)
@@ -235,13 +257,9 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
         else:
             target_ch = channels[0]  # Just use the first one to probe
 
-        suffixes = set()
-
-        # Probe the workspace info dictionary for density files matching our channel
-        for asset_key in sm.workspace.info_dict().keys():
-            # asset_key is a tuple: (type, channel, subtype)
-            if len(asset_key) >= 3 and asset_key[0] == 'density' and asset_key[1] == target_ch:
-                suffixes.add(asset_key[2] or '')  # subtype is the suffix
+        # The density sub-types are dynamic (e.g. counts_weighted_<weights_column>): look at the files
+        suffixes = set(self._density(sm, target_ch, None, pipeline=self.pipeline,
+                                     sample_id=sm.prefix).available_sub_types())
 
         # Fallback if scanning fails/is empty but we know defaults
         if not suffixes:
@@ -252,37 +270,40 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
 
         return sorted(list(suffixes))
 
-    def find_analysable_channels(self, *, density_suffix: str | None) -> List[str]:
+    def find_analysable_channels(self, *, density_suffix: str | None, groups: Optional[Dict[str, List[str]]] = None) -> List[str]:
         """
-        Inspects the first sample of the first group to infer which channels have density maps.
+        Inspects the first sample of the first group (see _first_sample_dir) to infer which channels
+        have density maps.
         """
-        if not self.groups:
+        first_folder = self._first_sample_dir(groups)
+        if first_folder is None:
             return []
-        first_group = next(iter(self.groups.values()))
-        if not first_group:
-            return []
-        first_folder = Path(first_group[0])
         sample_mgr = self.get_sample_manager_for(sample_src_dir=first_folder)
+
+        vasc_channels = sample_mgr.get_channels_by_pipeline('TubeMap', as_list=True)
 
         channels = []
         for ch in sample_mgr.pipeline_ready_channels:  # individual channels (CellMap, TractMap, Colocalization)
-            asset = sample_mgr.get('density', channel=ch, suffix=density_suffix, default=None)
+            if ch in vasc_channels:  # Only analysed through their compound channel, whose density is the one made
+                continue
+            asset = self._density(sample_mgr, ch, density_suffix, pipeline=self.pipeline, default=None)
             if asset is not None and asset.exists:
                 channels.append(ch)
 
-        vasc_channels = sample_mgr.get_channels_by_pipeline('TubeMap', as_list=True)
         if vasc_channels:
-            compound = tuple(vasc_channels)
-            asset = sample_mgr.get('density', channel=compound, asset_sub_type=density_suffix or None, default=None)
+            compound = register_compound_channel(sample_mgr, 'TubeMap', vasc_channels)  # its workspace id
+            asset = self._density(sample_mgr, compound, density_suffix, pipeline='TubeMap', default=None)
             if asset is not None and asset.exists:
-                    channels.append(compound)
+                channels.append(compound)
 
         return channels
 
-    def _get_annotator(self, sample_dir: Path, channel: str):
+    def _get_annotator(self, sample_dir: Path, channel: str | tuple[str, ...]):
+        """The atlas annotator of channel in the sample (the one of its representative part for a compound channel)"""
         reg = self.get_worker_for_sample(sample_dir, 'registration', channel=None)
         reg.setup_if_needed()
-        return reg.annotators[channel]
+        sample_manager = self.get_sample_manager_for(sample_dir)
+        return reg.annotator_of(representative_channel(sample_manager, self.pipeline, channel))
 
     def run_plots(self, plot_function, comparisons: List[Pair], *,
                   channel: str, plot_kw_args: Dict) -> list['QWebEngineView']:
@@ -298,7 +319,7 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
                 kwargs = dict(plot_kw_args, group_names=(gp1_name, gp2_name))
             else:
                 kwargs = plot_kw_args
-            df = pd.read_csv(self.assets.stats_table_path(channel, gp1_name, gp2_name))
+            df = pd.read_csv(self.assets.readable_path(self.assets.stats_table_path(channel, gp1_name, gp2_name), channel))
             fig = plot_function(df, **kwargs)
 
             web_view = QWebEngineView()
@@ -339,7 +360,8 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
             #  If provided, used to obtain an annotator and atlas scale for a sample.
             #  Defaults to building full processors via ``init_sample_manager_and_processors``.
 
-            annotator = aligner.annotators[ch or sm.alignment_reference_channel]
+            annotator = aligner.annotator_of(representative_channel(sm, self.pipeline,
+                                                                    ch or sm.alignment_reference_channel))
             atlas_id = aligner.config['atlas']['id']
             atlas_scale = [ATLAS_NAMES_MAP[atlas_id]['resolution']] * 3
             volume_map = annotator.get_lateralised_volume_map(atlas_scale)
@@ -373,8 +395,8 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
         if len(comparisons) > 1:  # Multiple comparisons: just show p-value maps
             p_val_imgs = []
             for gp1, gp2 in comparisons:
-                p_path = self.assets.p_val_colors_path(channel, gp1, gp2, suffix)
-                p_val_imgs.append(clm_io.read(p_path))
+                p_path = self.assets.readable_path(self.assets.p_val_colors_path(channel, gp1, gp2, suffix), channel)
+                p_val_imgs.append(io_ops.read(p_path))
 
             titles = [f'{gp1} vs {gp2} p values' for gp1, gp2 in comparisons]
             dvs = plot_3d.plot(p_val_imgs, title=titles, arrange=False, sync=True, parent=parent)
@@ -388,24 +410,24 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
             colored_atlas = annotator.create_color_annotation()
 
             panels = [
-                PlotPanel(images=res.gp1_avg, title=f'{gp1} avg', lut='flame'),
-                PlotPanel(images=res.gp2_avg, title=f'{gp2} avg', lut='flame'),
-                PlotPanel(images=res.p_vals, title='P values', lut=None),
+                plot_3d.PlotPanel(images=res.gp1_avg, title=f'{gp1} avg', lut='flame'),
+                plot_3d.PlotPanel(images=res.gp2_avg, title=f'{gp2} avg', lut='flame'),
+                plot_3d.PlotPanel(images=res.p_vals, title='P values', lut=None),
             ]
 
             if advanced:
                 if res.gp1_sd is not None:
-                    panels.append(PlotPanel(images=res.gp1_sd, title=f'{gp1} SD', lut='viridis'))
+                    panels.append(plot_3d.PlotPanel(images=res.gp1_sd, title=f'{gp1} SD', lut='viridis'))
                 if res.gp2_sd is not None:
-                    panels.append(PlotPanel(images=res.gp2_sd, title=f'{gp2} SD', lut='viridis'))
+                    panels.append(plot_3d.PlotPanel(images=res.gp2_sd, title=f'{gp2} SD', lut='viridis'))
                 if res.effect_size is not None:
-                    panels.append(PlotPanel(images=res.effect_size, title='Effect size', lut='flame'))
+                    panels.append(plot_3d.PlotPanel(images=res.effect_size, title='Effect size', lut='flame'))
 
             panels.append(
-                PlotPanel(images=colored_atlas, title='Atlas', lut=None, min_max=(0, 255))
+                plot_3d.PlotPanel(images=colored_atlas, title='Atlas', lut=None, min_max=(0, 255))
             )
 
-            dvs = multi_plot_from_panels(panels, arrange=False, sync=True, parent=parent)
+            dvs = plot_3d.multi_plot_from_panels(panels, arrange=False, sync=True, parent=parent)
 
             names_map = annotator.get_names_map()
             for dv in dvs:
@@ -421,6 +443,9 @@ class DensityGroupAnalysisOrchestrator(GroupOrchestratorBase):
         paths, titles = [], []
         for folder in group_folders:
             asset = self._density_asset(folder, channel, suffix=density_suffix or None)
+            if not asset.exists:
+                raise MissingRequirementException(f'No density map for {channel=}, suffix "{density_suffix}" '
+                                                  f'in {folder}: {asset.path} does not exist.')
             paths.append(asset.path)
             titles.append(self._sample_id(folder))
         dvs = plot_3d.plot(paths, title=titles, arrange=False, sync=True, lut=['flame']*len(paths), parent=parent)

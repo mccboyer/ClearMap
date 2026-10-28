@@ -25,6 +25,8 @@ class AdjustmentContext:
     group_base_dir: Optional[Path] = None
 
     run_label: str = ""    # Optional: useful for tracing / provenance
+    # The config as it was before the patch the adjusters run for (None when they run on the config as it is)
+    view_before_patch: Optional[ConfigView] = None
 
 
 TemplateForKey = Callable[[str], Optional[dict]]
@@ -44,6 +46,8 @@ class SampleManagerProtocol(Protocol):
     def renamed_channels(self) -> Dict[str, str]: ...
     def get_channels_by_pipeline(self, pipeline: str, as_list: bool = False) -> List[str]: ...
     def data_type(self, channel: str) -> Optional[str]: ...
+    @property
+    def reference_channel_setting(self) -> Optional[str]: ...
     @property
     def alignment_reference_channel(self) -> Optional[str]: ...
     @property

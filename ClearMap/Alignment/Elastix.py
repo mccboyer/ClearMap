@@ -71,15 +71,16 @@ import shutil
 import re
 from io import UnsupportedOperation
 from pathlib import Path
-import multiprocessing as mp
 
 import numpy as np
 
-
 import ClearMap.Settings as settings
-from ClearMap.Utils.exceptions import ClearMapException, ClearMapValueError, ClearMapRuntimeError
+from ClearMap.Utils.utilities import sanitize_n_processes
+from ClearMap.IO import conversion, io_ops
+from ClearMap.IO.FileUtils import atomic_write
+from ClearMap.IO.source.backends.tif_backend import TifSource
+from ClearMap.Utils.exceptions import ClearMapValueError, ClearMapRuntimeError
 
-import ClearMap.IO.IO as io
 from ClearMap.IO.elastix_config import ElastixParser
 
 from ClearMap.Alignment.Transformations.Transformation import TransformationBase
@@ -402,27 +403,37 @@ def set_path_transform_files(result_directory):
     rec = re.compile("\(InitialTransformParametersFileName \"(?P<parname>.*)\"\)")
 
     for f in files:
-        fh, tmpfn = tempfile.mkstemp()
         ff = os.path.join(result_directory, f)
-
-        with open(tmpfn, 'w') as newfile, open(ff) as parfile:
+        lines = []
+        with open(ff) as parfile:
             for line in parfile:
-                # print line
                 m = rec.match(line)
                 if m is not None:
                     pn = m.group('parname')
                     if pn != 'NoInitialTransform':
                         pathn, filen = os.path.split(pn)
                         filen = os.path.join(result_directory, filen)
-                        newfile.write(line.replace(pn, filen))
-                    else:
-                        newfile.write(line)
-                else:
-                    newfile.write(line)
+                        line = line.replace(pn, filen)
+                lines.append(line)
+        _replace_text_of_file(ff, ''.join(lines))
 
-        os.close(fh)
-        os.remove(ff)
-        shutil.move(tmpfn, ff)
+
+def _replace_text_of_file(path, text):
+    """
+    Replace the content of the file at path by text, keeping its permissions.
+
+    The text is written to a temporary file next to it, which is then moved over it (atomic_write):
+    we do not use the temp folder, since a move across file systems fails, and a temp file is private.
+    The temporary file is gone after the move, or removed if writing fails.
+    """
+    atomic_write(_write_text_with_mode_of, path, text, mode_source=path)
+
+
+def _write_text_with_mode_of(tmp_path, text, *, mode_source):
+    """Write text to tmp_path, with the permissions of mode_source (the file that tmp_path will replace)"""
+    with open(tmp_path, 'w') as new_file:
+        new_file.write(text)
+    shutil.copymode(mode_source, tmp_path)
 
 
 def set_metric_parameter_file(parameter_file_path, new_metric):
@@ -442,28 +453,18 @@ def set_metric_parameter_file(parameter_file_path, new_metric):
     metric_pattern = re.compile(r'\(Metric "(?P<metric_name>.*)"\)')
     metric_set = False
 
-    try:
-        with tempfile.NamedTemporaryFile('w', delete=False) as temp_file:
-            temp_file_path = temp_file.name
-            with open(parameter_file_path, 'r') as parameter_file:
-                for line in parameter_file:
-                    match = metric_pattern.match(line)
-                    if match:
-                        current_metric = match.group('metric_name')
-                        temp_file.write(line.replace(current_metric, new_metric))
-                        metric_set = True
-                    else:
-                        temp_file.write(line)
-            if not metric_set:
-                temp_file.write(f'(Metric "{new_metric}")\n')
-
-        shutil.move(temp_file_path, parameter_file_path)
-
-    except Exception as error:
-        print(f"Error setting metric in parameter file: {error}")
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise error
+    lines = []
+    with open(parameter_file_path, 'r') as parameter_file:
+        for line in parameter_file:
+            match = metric_pattern.match(line)
+            if match:
+                current_metric = match.group('metric_name')
+                line = line.replace(current_metric, new_metric)
+                metric_set = True
+            lines.append(line)
+    if not metric_set:
+        lines.append(f'(Metric "{new_metric}")\n')
+    _replace_text_of_file(parameter_file_path, ''.join(lines))
 
 
 def result_data_file(result_directory):
@@ -662,7 +663,7 @@ def align(fixed_image, moving_image, affine_parameter_file=None, bspline_paramet
         if affine_parameter_file or bspline_parameter_file:
             raise ClearMapValueError('Cannot specify both parameter_files and affine_parameter_file or bspline_parameter_file')
 
-    processes = processes if processes is not None else mp.cpu_count()
+    processes = sanitize_n_processes(processes)
 
     check_elastix_initialized()
 
@@ -776,13 +777,13 @@ def transform(source, sink='transformix', transform_parameter_file=None, transfo
     check_elastix_initialized()
 
     # image
-    source = io.open_ro(source)
-    if isinstance(source, io.tif.Source):
+    source = io_ops.open_ro(source)
+    if isinstance(source, TifSource):
         img_name = source.location
         delete_image = None
     else:
         img_name = os.path.join(tempfile.gettempdir(), 'elastix_input.tif')
-        io.write(img_name, source)
+        io_ops.write(img_name, source)
         delete_image = img_name
 
     # result directory
@@ -819,10 +820,10 @@ def transform(source, sink='transformix', transform_parameter_file=None, transfo
         return result_data_file(result_dirname)
     elif sink is None:
         result_file = result_data_file(result_dirname)
-        result = io.read(result_file)
+        result = io_ops.read(result_file)
     elif isinstance(sink, str):
         result_file = result_data_file(result_dirname)
-        result = io.convert(result_file, sink)
+        result = conversion.convert(result_file, sink)
     else:
         raise ClearMapRuntimeError('transform_data: sink not valid!')
 
@@ -891,10 +892,10 @@ def deformation_field(sink='transformix', transform_parameter_file=None, transfo
         return result_data_file(result_dirname)
     elif sink is None:
         result_file = result_data_file(result_dirname)
-        result = io.read(result_file)
+        result = io_ops.read(result_file)
     elif isinstance(sink, str):
         result_file = result_data_file(result_dirname)
-        result = io.convert(result_file, sink)
+        result = conversion.convert(result_file, sink)
     else:
         raise ClearMapRuntimeError('deformation_field: sink not valid!')
 
@@ -922,7 +923,7 @@ def deformation_distance(deformation_field, sink=None, scale=None):
       Array or file name of the deformation distance data.
     """
 
-    deformation_field = io.read(deformation_field)
+    deformation_field = io_ops.read(deformation_field)
 
     df = np.square(deformation_field)
     if scale is not None:
@@ -930,7 +931,7 @@ def deformation_distance(deformation_field, sink=None, scale=None):
             df[:, :, :, i] = df[:, :, :, i] * (scale[i] * scale[i])
     df = np.sqrt(np.sum(df, axis=3))
 
-    return io.write(sink, df)
+    return io_ops.write(sink, df)
 
 
 ###############################################################################
@@ -956,7 +957,7 @@ def write_points(filename, points, indices=False, binary=True):
     """
 
     if not isinstance(points, np.ndarray):
-        points = io.read(points)
+        points = io_ops.read(points)
 
     if binary:
         with open(filename, 'wb') as point_file:
@@ -1042,7 +1043,7 @@ def transform_points(source, sink=None, transform_parameter_file=None, transform
 
     Arguments
     ---------
-    source : str
+    source : str | np.ndarray
       Source of the points.
     sink : str or None
       Sink for transformed points.
@@ -1081,7 +1082,7 @@ def transform_points(source, sink=None, transform_parameter_file=None, transform
             binary = source[-3:] == 'bin'
             point_file = source
         else:
-            points = io.read(source)
+            points = io_ops.read(source)
             point_file = temp_file
             delete_point_file = temp_file
             write_points(point_file, points, indices=indices, binary=binary)
@@ -1135,7 +1136,7 @@ def transform_points(source, sink=None, transform_parameter_file=None, transform
     if delete_result_directory:
         shutil.rmtree(delete_result_directory)
 
-    return io.write(sink, transformed_points)
+    return io_ops.write(sink, transformed_points)
 
 
 def inverse_transform(fixed_image, affine_parameter_file, bspline_parameter_file=None, transform_parameter_file=None,

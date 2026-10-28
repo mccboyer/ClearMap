@@ -89,16 +89,16 @@ from typing import Optional, Dict, Any, Union, Callable
 import numpy as np
 import pandas as pd
 
-from PyQt5.QtWidgets import QDialogButtonBox
-
 import ClearMap.IO.IO as clearmap_io
-from ClearMap.IO.Source import Source
+from ClearMap.IO.source.Source import Source
 from ClearMap.IO.workspace2 import Workspace2
 from ClearMap.IO.workspace_asset import Asset
 
+from ClearMap.config.compound_keys import compound_channel_key
 from ClearMap.config.config_coordinator import ConfigCoordinator
 
-from ClearMap.pipeline_orchestrators.generic_orchestrators import PipelineOrchestrator, ProcessorSteps
+from ClearMap.pipeline_orchestrators.generic_orchestrators import (CompoundChannelPipelineOrchestrator, ProcessorSteps,
+                                                                   representative_channel)
 
 import ClearMap.Alignment.Resampling as resampling_module
 import ClearMap.Alignment.Elastix as elastix
@@ -118,11 +118,14 @@ import ClearMap.Analysis.Measurements.radius_measurements as measure_radius
 import ClearMap.Analysis.Measurements.Voxelization as voxelization
 
 from ClearMap.Analysis.graphs import graph_processing
-from ClearMap.Analysis.graphs.graph_filters import GraphFilter
+from ClearMap.Analysis.graphs.graph_filters import GraphFilter, combine_filters, combined_filters_name
+from ClearMap.Analysis.graphs.graph_weights import GraphWeight
+from ClearMap.IO.assets_specs import weighted_sub_type
 
-from ClearMap.gui.dialog_helpers import warning_popup
-from ClearMap.Utils.utilities import is_in_range, get_free_v_ram, clear_cuda_cache, sanitize_n_processes
-from ClearMap.Utils.exceptions import (PlotGraphError, ClearMapVRamException,
+from ClearMap.Utils.events import WorkspaceChannelsUpdated
+from ClearMap.Utils.utilities import sanitize_n_processes
+from ..Utils.nvidia_utils import get_free_v_ram, clear_cuda_cache
+from ClearMap.Utils.exceptions import (PlotGraphError, ClearMapVRamException, ChannelsNotPixelAlignedError,
                                        MissingRequirementException, MissingAssetError, AssetNotFoundError,
                                        ClearMapAssetError, ClearMapValueError)
 
@@ -140,8 +143,11 @@ __copyright__ = 'Copyright © 2020 by Christoph Kirst'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
 
+from ..IO import io_ops
 
+DEEP_FILL_REQUIRED_V_RAM = 22_000  # MiB (as reported by nvidia-smi) of free VRAM needed by the deep fill
 MAX_PLOT_VERTICES = 300_000  # Empirical max number of vertices that can safely be plotted
+BRANCHES_DENSITY_SUB_TYPE = 'branches'  # Variants: branches[_weighted_<weight name>][_<filters name>]
 
 USE_BINARY_POINTS_FILE = not platform.system().lower().startswith('darwin')
 _SourcePath = Union[Path, str]
@@ -244,7 +250,7 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
         """
         if isinstance(output, Asset):
             return output.path
-        elif isinstance(output, Source):  # covers MMP.Source, npy.Source …
+        elif isinstance(output, Source):  # covers MMPSource, NpySource …
             return output.location
         elif isinstance(output, (Path, str)):
             return output
@@ -328,17 +334,56 @@ class BinaryVesselProcessorSteps(ProcessorSteps):
         raise FileNotFoundError(f'No binary output found for channel "{self.channel}"')
 
 
-class BinaryVesselProcessor(PipelineOrchestrator):
+class TubeMapOrchestrator(CompoundChannelPipelineOrchestrator, abstract=True):
+    """
+    The TubeMap processors all process the same compound channel: the sample channels of the
+    TubeMap pipeline (vessels, arteries, veins), see compound_channel_of.
+    """
+    pipeline = 'TubeMap'
     config_name = 'vasculature'
 
+    @classmethod
+    def compound_channel_of(cls, sample_manager: SampleManager) -> tuple[str, ...]:
+        """
+        The TubeMap compound channel of the sample: its channels whose data type belongs to the
+        pipeline, sorted (compound_channel_key: they are combined, their order does not matter).
+        The single source of the channels the TubeMap processors combine.
+        """
+        channels = sample_manager.get_channels_by_pipeline(cls.pipeline, as_list=True)
+        return compound_channel_key(channels, oriented=cls.oriented) if channels else ()
+
+    @property
+    def required_sample_channels(self) -> list[str]:
+        """The sample channels of the TubeMap pipeline, read from the config (compound_channel is set by setup)"""
+        return list(self.compound_channel_of(self.sample_manager))
+
+    def _follow_sample_compound_channel(self) -> None:
+        """
+        Set compound_channel from the sample (compound_channel_of) and register it. When it changed,
+        the registry entry of the previous one is dropped (only the entry: no file is deleted).
+        """
+        previous = self.compound_channel
+        self.compound_channel = self.compound_channel_of(self.sample_manager)
+        if previous and previous != self.compound_channel:
+            self.workspace.asset_collections.pop(previous, None)
+        self.register_in_workspace()
+
+    @property
+    def representative_channel(self) -> str:
+        """
+        The part of the compound channel read for what all the parts share, as they are imaged together
+        (see COMPOUND_REPRESENTATIVE_DATA_TYPES).
+        """
+        return representative_channel(self.sample_manager, self.pipeline, self.compound_channel_of(self.sample_manager))
+
+
+class BinaryVesselProcessor(TubeMapOrchestrator):
     def __init__(self, sample_manager: Optional[SampleManager] = None,
                  config_coordinator: Optional[ConfigCoordinator] = None):
         super().__init__(config_coordinator)
         self.sample_manager: Optional[SampleManager] = None
         self.workspace: Optional[Workspace2] = None
 
-        self.inputs_match = False
-        self.inputs_shapes: tuple = (None, None)
 
         self.all_vessels_channel: str = ''
         self.arteries_channel: str = ''
@@ -350,71 +395,73 @@ class BinaryVesselProcessor(PipelineOrchestrator):
                                   re.compile(r'.*?Vessel filling: processing block \d+/\d+.*?\selapsed time:\s\d+:\d+:\d+\.\d+'))
 
         self.setup(sample_manager)
+        self.subscribe(WorkspaceChannelsUpdated, self._on_workspace_channels_updated)
+
+    def _on_workspace_channels_updated(self, evt: WorkspaceChannelsUpdated) -> None:
+        """Channels/data types changed in the workspace: resync the steps and the compound channel"""
+        if not self.sample_ready:
+            return
+        if self.workspace is None or self.compound_channel_of(self.sample_manager) != self.compound_channel:
+            self.setup()
 
     def setup(self, sample_manager=None):
         self.sample_manager = sample_manager if sample_manager is not None else self.sample_manager
-        if self.sample_manager is not None and self.sample_manager.setup_complete:
+        self._setup_done = False
+        if self.sample_ready:
             self.workspace = self.sample_manager.workspace
 
             self.all_vessels_channel = self.sample_manager.get_channels_by_type(channel_type='vessels')
-            if not self.all_vessels_channel:
-                warnings.warn('Vessels channel not set')
-                return
-
             # noinspection PyTypeChecker
             self.arteries_channel = self.sample_manager.get_channels_by_type(channel_type='arteries',
                                                                              multiple_found_action='warn')
+            if not self.all_vessels_channel:
+                warnings.warn('Vessels channel not set')
+                self.steps.clear()
+                self.compound_channel = ()
+                return
 
-            self.assert_input_shapes_match()
+            self._follow_sample_compound_channel()
 
-            all_channels = self.sample_manager.channels
-            obsolete_channels = [k for k in self.steps if k not in all_channels]
-            for k in obsolete_channels:
+            try:  # Told now, refused before binarizing (the user may be setting the channels up)
+                self.check_inputs_pixel_aligned()
+            except ChannelsNotPixelAlignedError as err:
+                warnings.warn(str(err))
+
+            # Drop steps of channels that are not (or no longer) binarized: removed OR re-typed
+            for k in [k for k in self.steps if k not in self.compound_channel]:
                 del self.steps[k]
 
-            for channel_name in self.channels_to_binarize():
-                if channel_name:
-                    self.steps[channel_name] = BinaryVesselProcessorSteps(
-                        self.workspace, channel=channel_name,
-                        config_provider=lambda ch=channel_name: (
-                            self.config.get('binarization', {}).get('single_channels', {}).get(ch, {})))
-
-            compound_channel = tuple(self.channels_to_binarize())  # FIXME: old keys not cleared
-            sample_id = self.sample_manager.prefix
-            self.workspace.ensure_pipeline('TubeMap', compound_channel, sample_id=sample_id,
-                                           channel_content_type='compound', create_channel=True)
+            for channel_name in self.compound_channel:  # Recreated on each setup
+                self.steps[channel_name] = BinaryVesselProcessorSteps(
+                    self.workspace, channel=channel_name,
+                    config_provider=lambda ch=channel_name: (
+                        self.config.get('binarization', {}).get('single_channels', {}).get(ch, {})))
+            self._setup_done = True
 
     # ############################### INPUTS ###############################
 
-    def assert_input_shapes_match(self):
+    def check_inputs_pixel_aligned(self, require_stitched: bool = False) -> None:
         """
-        Ensure that the input shapes (stitched images of the different color channels) match
-        before starting the binarization process since they must overlap.
+        Check that the channels to binarize match pixel for pixel, as they are combined voxel for voxel
+        (see SampleManager.check_pixel_aligned). A single channel has nothing to match.
 
-        .. warning::
-            stitched may not exist when processor is created.
-            if not, check again in the run/binarize method
+        Raises
+        ------
+        ChannelsNotPixelAlignedError
+            Naming each requirement which is not met.
+        MissingRequirementException
+            If require_stitched and the stitched image of one of them is missing.
         """
-        try:
-            assets_to_binarize = self.assets_to_binarize()
-            shapes = [asset.shape() for asset in assets_to_binarize]
-        except FileNotFoundError:
-            warnings.warn('Stitched images not found. Cannot check shapes.')
-            self.inputs_shapes = None, None
-            return
-        if not all([s == shapes[0] for s in shapes]):
-            self.inputs_match = False
-            self.inputs_shapes = shapes
-            raise ValueError(f'Channels to binarize have different shapes. This is not supported yet.'
-                             f'Got shapes: {shapes}')
-        self.inputs_match = True  # WARNING: may need to be reset when changing channels to binarize
-        self.inputs_shapes = shapes
+        if len(self.channels_to_binarize) > 1:
+            self.sample_manager.check_pixel_aligned(*self.channels_to_binarize, require_stitched=require_stitched)
 
-    def channels_to_binarize(self):
-        return self.sample_manager.get_channels_by_pipeline('TubeMap', as_list=True)
+    @property
+    def channels_to_binarize(self) -> tuple[str, ...]:
+        """The channels binarized one by one, then combined: the parts of compound_channel"""
+        return self.compound_channel
 
     def assets_to_binarize(self) -> list[Any]:
-        channels_to_binarize = self.channels_to_binarize()
+        channels_to_binarize = self.channels_to_binarize
         assets_to_binarize = [self.workspace.get('stitched', channel=c) for c in channels_to_binarize]
         return assets_to_binarize
 
@@ -422,18 +469,14 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
     def run(self):
         self.binarize()
-        for channel in self.channels_to_binarize():
+        for channel in self.channels_to_binarize:
             self.postprocess(channel)
         self.combine_binary()
 
     def binarize(self):
-        if not self.inputs_match:
-            self.assert_input_shapes_match()
-        if self.inputs_match:
-            for channel in self.channels_to_binarize():
-                self.binarize_channel(channel)
-        else:
-            raise ValueError('Channels to binarize have different shapes. This is not supported yet.')
+        self.check_inputs_pixel_aligned(require_stitched=True)
+        for channel in self.channels_to_binarize:
+            self.binarize_channel(channel)
 
     def postprocess(self, channel: str) -> None:
         """
@@ -478,7 +521,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
                          if stp not in BinaryVesselProcessorSteps._lifecycle_steps]
                          # and stp in asset_to_gui]  # TODO: check guard against unknown steps
             first_op = gui_order[0] if gui_order else operation_type
-            first_step = channel == self.channels_to_binarize()[0] and operation_type == first_op
+            first_step = channel == self.channels_to_binarize[0] and operation_type == first_op
             increment_main = not first_step
             self.prepare_watcher_for_substep(n_blocks, self.block_re,
                                              f'{operation_type} {channel.title()}', increment_main)
@@ -558,8 +601,8 @@ class BinaryVesselProcessor(PipelineOrchestrator):
             The channel to plot
         """
         from ClearMap.Visualization.Qt import Plot3d as q_p3d
-        images = [(self.get_path('stitched', asset_sub_type=channel)),
-                  (self.get_path('binary', asset_sub_type=channel))]
+        images = [self.get_path('stitched', channel=channel),
+                  self.get_path('binary', channel=channel)]  # The binarize sink
         dvs = q_p3d.plot(images, title=[img.name for img in images],
                          arrange=arrange, lut=self.machine_config['default_lut'], parent=parent)
         return dvs
@@ -572,7 +615,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         self.steps[channel].remove_next_steps_files(self.steps[channel].smoothed)
 
         source = self.steps[channel].get_source(BinaryVesselProcessorSteps.smoothed)
-        source = clearmap_io.open_ro(source)
+        source = io_ops.open_ro(source)
         sink_path = self.get_path('binary', channel=channel, asset_sub_type='smoothed')
         smoothing_parameters = copy.deepcopy(vasculature.default_postprocessing_parameter['smooth'])
 
@@ -596,7 +639,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         self.steps[channel].remove_next_steps_files(self.steps[channel].filled)
 
         source = self.steps[channel].get_source(BinaryVesselProcessorSteps.filled)
-        source = clearmap_io.open_ro(source)
+        source = io_ops.open_ro(source)
         sink = self.get_path('binary', channel=channel, asset_sub_type='filled')
         sink = initialize_sink(sink, shape=source.shape, dtype=source.dtype, order=source.order, return_buffer=False)
 
@@ -614,7 +657,6 @@ class BinaryVesselProcessor(PipelineOrchestrator):
             return
 
         perf_params = self.config['performance']['binarization']['single_channels'][channel]['deep_fill']['block_processing']
-        REQUIRED_V_RAM = 22000  # REFACTOR: put in config or at top of module
         if size_max is None:
             size_max = perf_params['size_max']
         if overlap is None:
@@ -622,15 +664,12 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         if resample_factor is None:
             resample_factor = binary_cfg['deep_fill']['resample_factor']
 
-        if not get_free_v_ram() > REQUIRED_V_RAM:
-            btn = warning_popup(f'Insufficient VRAM',
-                                f'You do not have enough free memory on your graphics card to '
-                                f'run this operation. This step needs 22GB VRAM, {get_free_v_ram() / 1000} were found. '
-                                f'Please free some or upgrade your hardware.')
-            if btn == QDialogButtonBox.Abort:
-                raise ClearMapVRamException(f'Insufficient VRAM, found only {get_free_v_ram()} < {REQUIRED_V_RAM}')
-            elif btn == QDialogButtonBox.Retry:
-                self._deep_fill_channel(channel, size_max, overlap, resample_factor)
+        free_v_ram = get_free_v_ram()
+        if free_v_ram <= DEEP_FILL_REQUIRED_V_RAM:  # Headless: the caller decides (e.g. the GUI offers to retry)
+            raise ClearMapVRamException(f'Insufficient VRAM for the deep fill of channel "{channel}": it needs '
+                                        f'{DEEP_FILL_REQUIRED_V_RAM / 1000:.0f} GB of free VRAM, '
+                                        f'{free_v_ram / 1000:.1f} GB were found. '
+                                        f'Please free some or upgrade your hardware.')
 
         self.steps[channel].remove_next_steps_files(self.steps[channel].deep_filled)
 
@@ -651,10 +690,9 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
     def combine_binary(self):
         """Merge the binary images of the different vascular network components into a single mask"""
-        # FIXME: probably missing the call to workspace.add_channel(self.channels_to_binarize())
-        sink_asset = self.get('binary', channel=self.channels_to_binarize(), asset_sub_type='combined')  # Temporary
-        if len(self.channels_to_binarize()) > 1:
-            sources = [self.steps[ch].get_last_output() for ch in self.channels_to_binarize()]
+        sink_asset = self.get('binary', channel=self.compound_channel, asset_sub_type='combined')  # Temporary
+        if len(self.channels_to_binarize) > 1:
+            sources = [self.steps[ch].get_last_output() for ch in self.channels_to_binarize]
             perf_params = self.config['performance']['binarization']['combine']['block_processing']
             block_processing.process(np.logical_or, sources, sink_asset.path,
                                      size_max=perf_params['size_max'], overlap=perf_params['overlap'],
@@ -670,8 +708,8 @@ class BinaryVesselProcessor(PipelineOrchestrator):
 
     def post_process_binary_combined(self):
         """Postprocess the combined binary image (typically smooth and fill)"""
-        source = self.get_path('binary', self.channels_to_binarize(), asset_sub_type='combined')
-        sink = self.get_path('binary', self.channels_to_binarize(), asset_sub_type='final')
+        source = self.get_path('binary', self.compound_channel, asset_sub_type='combined')
+        sink = self.get_path('binary', self.compound_channel, asset_sub_type='final')
         if self.config['binarization']['combined']['binary_fill']:
             postprocessing_parameter = copy.deepcopy(vasculature.default_postprocessing_parameter)
             block_params = copy.deepcopy(vasculature.default_postprocessing_processing_parameter)
@@ -697,7 +735,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         from ClearMap.Visualization.Qt import Plot3d as q_p3d
         all_vessels = self.steps[self.all_vessels_channel].get_asset(self.steps[self.all_vessels_channel].filled,
                                                                      step_back=True)
-        combined = self.get_path('binary', channel=self.channels_to_binarize(), asset_sub_type='combined')
+        combined = self.get_path('binary', channel=self.compound_channel, asset_sub_type='combined')
         if self.config['binarization']['single_channels'][self.arteries_channel]['binarize']['run']:
             arteries_filled = self.get_path('binary', channel=self.arteries_channel, asset_sub_type='filled')
             dvs = q_p3d.plot([all_vessels, arteries_filled, combined], title=['all vessels', 'arteries', 'combined'],
@@ -727,7 +765,7 @@ class BinaryVesselProcessor(PipelineOrchestrator):
         return dvs, titles
 
 
-class VesselGraphProcessor(PipelineOrchestrator):
+class VesselGraphProcessor(TubeMapOrchestrator):
     """
     The graph contains the following edge properties:
         * artery_raw
@@ -737,7 +775,6 @@ class VesselGraphProcessor(PipelineOrchestrator):
         * radii
         * distance_to_surface
     """
-    config_name = 'vasculature'
 
     # Legacy voxel-space thresholds — kept for old graphs without spacing/radius_units
     # New graphs use µm equivalents from config
@@ -782,29 +819,30 @@ class VesselGraphProcessor(PipelineOrchestrator):
         self.branch_density = None
         self.steps: VesselGraphProcessorSteps = VesselGraphProcessorSteps(self.workspace)  # FIXME: handle skeleton
         self.setup(sample_manager, registration_processor)
-        self.parent_channels = tuple(self.config['binarization']['single_channels'].keys())
-        self.steps.channel = self.parent_channels
+        self.subscribe(WorkspaceChannelsUpdated, self._on_workspace_channels_updated)
+
+    def _on_workspace_channels_updated(self, evt: WorkspaceChannelsUpdated) -> None:
+        if self.sample_ready:
+            self.setup()
 
     def setup(self, sample_manager=None, registration_processor=None):
         self.sample_manager = sample_manager if sample_manager is not None else self.sample_manager
         self.registration_processor = registration_processor or self.registration_processor
-        if self.sample_manager is not None and self.sample_manager.setup_complete:
+        self._setup_done = False
+        if self.sample_ready:
             self.workspace = self.sample_manager.workspace
             self.steps.workspace = self.workspace
 
-            self.parent_channels = tuple(self.config['binarization']['single_channels'].keys())
-            self.steps.channel = self.parent_channels
-
-            sample_id = self.sample_manager.prefix
-            self.workspace.ensure_pipeline('TubeMap', self.parent_channels, channel_content_type='compound',
-                                           sample_id=sample_id, create_channel=True)
+            self._follow_sample_compound_channel()
+            self.steps.channel = self.compound_channel
+            self._setup_done = True
 
     def __get_graph(self, step):
         if step not in self.__graphs:
             raise ValueError(f'Unknown graph step "{step}"')
         g = self.__graphs[step]
         if g is None:
-            g = self.get('graph', channel=self.parent_channels, asset_sub_type=step).read()
+            g = self.get('graph', channel=self.compound_channel, asset_sub_type=step).read()
             self.__graphs[step] = g
         return g
 
@@ -815,7 +853,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     def save_graph(self, base_name):
         graph = self.__graphs[base_name]  # We do not use the getter here to avoid loading the graph
-        self.get('graph', channel=self.parent_channels, asset_sub_type=base_name).write(graph)
+        self.get('graph', channel=self.compound_channel, asset_sub_type=base_name).write(graph)
 
     @staticmethod
     def _graph_radius_level(graph) -> 'VesselGraphProcessor.RadiusLevel':
@@ -935,7 +973,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
             @functools.wraps(operation)
             def wrapper(self, *args, **kwargs):
                 try:
-                    self.get('binary', channel=self.parent_channels, asset_sub_type=asset_sub_type)
+                    self.get('binary', channel=self.compound_channel, asset_sub_type=asset_sub_type)
                 except FileNotFoundError:
                     raise MissingRequirementException(f"Binary asset '{asset_sub_type}' is missing.")
                 return operation(self, *args, **kwargs)
@@ -999,32 +1037,32 @@ class VesselGraphProcessor(PipelineOrchestrator):
         if self.config['graph_construction']['skeletonize']:
             n_blocks = 100  # TODO: TBD
             self.prepare_watcher_for_substep(n_blocks, self.skel_re, f'Skeletonization', True)
-            if len(self.parent_channels) == 1:
-                binary = binary_processor.steps[self.parent_channels[0]].get_last_output()
+            if len(self.compound_channel) == 1:
+                binary = binary_processor.steps[self.compound_channel[0]].get_last_output()  # The single part
             else:
                 for sfx in ('final', 'combined'):
-                    binary_asset = self.get('binary', channel=self.parent_channels,
+                    binary_asset = self.get('binary', channel=self.compound_channel,
                                             asset_sub_type=sfx)  # WARNING final changed to deep filled
                     if binary_asset.exists:
                         binary = binary_asset.path
                         break
 
-            skeletonization.skeletonize(binary, sink=self.get_path('skeleton', channel=self.parent_channels),  # WARNING: prange
+            skeletonization.skeletonize(binary, sink=self.get_path('skeleton', channel=self.compound_channel),  # WARNING: prange
                                         delete_border=True, n_processes=self._n_processes('skeletonize'), verbose=True)
 
     def _measure_radii(self, binary_processor=None):  # FIXME: do on the clean graph to avoid measuring cliques ?
         coordinates = self.graph_raw.vertex_coordinates()
 
-        if len(self.parent_channels) == 1:
-            source = binary_processor.steps[self.parent_channels[0]].get_last_output()
+        if len(self.compound_channel) == 1:
+            source = binary_processor.steps[self.compound_channel[0]].get_last_output()  # The single part
         else:
             for sfx in ('final', 'combined'):
-                binary_asset = self.get('binary', channel=self.parent_channels,
+                binary_asset = self.get('binary', channel=self.compound_channel,
                                         asset_sub_type=sfx)  # WARNING final changed to deep filled
                 if binary_asset.exists:
                     source = binary_asset.path
                     break
-        spacing = np.array(self.sample_manager.get_channel_resolution(self.parent_channels[0])) # µm/vox, shape (3,)
+        spacing = np.array(self.sample_manager.get_channel_resolution(self.representative_channel)) # µm/vox, shape (3,)
 
         # Distances in all 3 directions
         radii_um_axial = measure_radius.measure_radius(source, coordinates,
@@ -1140,8 +1178,8 @@ class VesselGraphProcessor(PipelineOrchestrator):
             n_blocks = 100  # TBD:
             self.prepare_watcher_for_substep(n_blocks, self.build_graph_re, 'Building graph', True)
             self.steps.remove_next_steps_files(self.steps.graph_raw)
-            skeleton_path = self.get_path('skeleton', channel=self.parent_channels)
-            spacing = self.sample_manager.get_channel_resolution(self.parent_channels[0])
+            skeleton_path = self.get_path('skeleton', channel=self.compound_channel)
+            spacing = self.sample_manager.get_channel_resolution(self.representative_channel)
             self.graph_raw = graph_processing.graph_from_skeleton(skeleton_path, spacing=spacing, physical_units='µm',
                                                                   check_border=False,
                                                                   n_processes=self._n_processes('build'), verbose=True)  # WARNING: main thread (prange)
@@ -1214,11 +1252,11 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     @property
     def resampled_shape(self):  # Can be any of the parent channels because they ought to have the same shape
-        return self.get('resampled', channel=self.parent_channels[0]).shape()
+        return self.get('resampled', channel=self.representative_channel).shape()
 
     @property
     def binary_shape(self):
-        return self.get('binary', channel=self.parent_channels, asset_sub_type='final').shape()
+        return self.get('binary', channel=self.compound_channel, asset_sub_type='final').shape()
 
     # Atlas registration and annotation
     def _transform(self):
@@ -1229,8 +1267,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
                 resampled_shape=self.resampled_shape)
 
             if self.registration_processor.was_registered:
-                for channel in self.get_registration_sequence_channels():
-                    results_dir = self.get_path('aligned', channel=channel).parent
+                for results_dir in self.registration_processor.get_transform_directories(self.representative_channel):
                     coordinates = elastix.transform_points(coordinates, transform_directory=results_dir,
                                                            binary=USE_BINARY_POINTS_FILE, indices=False)
             return coordinates
@@ -1265,7 +1302,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
         else:
             self._legacy_warn('_scale (no spacing)')
             spacing = np.array(
-                self.sample_manager.get_channel_resolution(self.parent_channels[0]))
+                self.sample_manager.get_channel_resolution(self.representative_channel))
 
         atlas_spacing      = spacing / resample_factor                # µm/atlas-vox (3,)
         atlas_spacing_mean = float(np.mean(atlas_spacing))
@@ -1323,8 +1360,8 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     def _annotate(self):
         """Atlas annotation of the graph (i.e. add property 'region' to vertices)"""
-        annotator = self.registration_processor.annotators[
-            self.parent_channels[0]]  # warning: assuming same annotator for all channels
+        annotator = self.registration_processor.annotator_of(
+            self.representative_channel)  # warning: assuming same annotator for all channels
         self.graph_reduced.annotate_properties(functools.partial(annotator.label_points),
                                                vertex_properties={'coordinates_atlas': 'annotation'},
                                                edge_geometry_properties={'coordinates_atlas': 'annotation'})
@@ -1335,7 +1372,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
 
     def _compute_distance_to_surface(self):
         """add distance to brain surface as vertices properties"""
-        distance_atlas = self.get('atlas', channel=self.parent_channels[0],
+        distance_atlas = self.get('atlas', channel=self.representative_channel,
                                   asset_sub_type='distance_to_surface').read()
         atlas_shape = distance_atlas.shape
 
@@ -1460,7 +1497,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
         classifier = VesselClassifier(self.graph_annotated, cfg, signals)
         classifier.classify()
 
-        self.graph_annotated.save(self.get_path('graph', channel=self.parent_channels))
+        self.graph_annotated.save(self.get_path('graph', channel=self.compound_channel))
         self.graph_traced = self.graph_annotated
 
     def __get_branch_voxelization_params(self):
@@ -1468,55 +1505,111 @@ class VesselGraphProcessor(PipelineOrchestrator):
             'method': 'sphere',
             'radius': tuple(self.config['visualization']['voxelization']['size']),
             'weights': None,
-            'shape': self.get('atlas', channel=self.parent_channels[0], asset_sub_type='reference').shape(),
+            'shape': self.get('atlas', channel=self.representative_channel, asset_sub_type='reference').shape(),
             'verbose': True
         }
         return voxelize_branch_parameter
 
-    def __voxelize(self, vertices, voxelize_branch_parameter: dict[str, Any]):
-        density_path = self.get_path('density', channel=self.parent_channels, asset_sub_type='branches')
+    def __voxelize(self, vertices, voxelize_branch_parameter: dict[str, Any], density_path: Path):
         clearmap_io.delete_file(density_path)
         self.branch_density = voxelization.voxelize(vertices,
                                                     sink=density_path,
                                                     dtype='float32',
                                                     **voxelize_branch_parameter)  # WARNING: prange
 
+    def density_asset(self, weight: GraphWeight | None = None, filters=None, operators=None):
+        """
+        The branches density map for this weight and these filters:
+        ``density_branches[_weighted_<weight name>][_<filters name>]``
+        (see assets_specs.weighted_sub_type and graph_filters.combined_filters_name),
+        so that one sample can hold several density maps (e.g. for group analyses).
+
+        Parameters
+        ----------
+        weight: GraphWeight | None
+        filters: list[GraphFilter] | None
+        operators: list[str] | None
+            The operator between each pair of consecutive filters ('and' or 'or').
+        """
+        sub_type = BRANCHES_DENSITY_SUB_TYPE
+        if weight is not None:
+            sub_type = weighted_sub_type(sub_type, weight.name)
+        if filters:
+            sub_type += f'_{combined_filters_name(filters, operators or [])}'
+        return self.get('density', channel=self.compound_channel, suffix=sub_type)  # suffix: dynamic sub-type
+
+    @staticmethod
+    def _with_degree_filter(graph, vertex_degrees, filters, operators):
+        """
+        filters and operators with, if vertex_degrees is set, a vertex degree filter and-ed after them.
+        The caller's lists are not modified.
+
+        Parameters
+        ----------
+        graph: Graph | None
+            None is enough to name the filters.
+        vertex_degrees: int | tuple[int, int] | None
+            A degree or a (min, max) degree range.
+        filters: list[GraphFilter] | None
+        operators: list[str] | None
+        """
+        filters = list(filters or [])
+        operators = list(operators or [])
+        if vertex_degrees is not None:  # A degree is an equality filter, a pair a range (see GraphFilter.as_mask)
+            if filters:
+                operators.append('and')
+            filters.append(GraphFilter(graph, 'vertex', 'degree', vertex_degrees))
+        return filters, operators
+
     # @requires_graph('traced')
-    def voxelize(self, weight_by_radius=False, vertex_degrees=None, filters=None, operators=None):
+    def voxelize(self, weight: GraphWeight | None = None, vertex_degrees=None, filters=None, operators=None):
+        """
+        Voxelize the graph vertices (branch points) into density_asset(weight, filters, operators).
+
+        Parameters
+        ----------
+        weight: GraphWeight | None
+            How much each vertex counts (e.g. GraphWeight(graph, 'vertex', 'radius_units')). None: 1 each.
+        vertex_degrees: int | tuple[int, int] | None
+            Only voxelize the vertices of this degree (or (min, max) degree range):
+            a vertex degree filter and-ed after the filters, so also part of the density name.
+        filters: list[GraphFilter] | None
+            Only voxelize the vertices selected by these filters.
+        operators: list[str] | None
+            The operator between each pair of consecutive filters ('and' or 'or'),
+            applied from left to right (see graph_filters.combine_filters).
+        """
+        # Validate the names before loading the graph
+        self.density_asset(weight, *self._with_degree_filter(None, vertex_degrees, filters, operators))
         try:
             graph = self.graph_traced
         except (KeyError, FileNotFoundError):
             graph = self.graph_annotated
+        filters, operators = self._with_degree_filter(graph, vertex_degrees, filters, operators)
+        density_asset = self.density_asset(weight, filters, operators)
         vertices = graph.vertex_property('coordinates_atlas')
         voxelize_branch_parameter = self.__get_branch_voxelization_params()
 
-        if vertex_degrees:
-            if filters is None:
-                filters = []
-                operators = []
-            if not isinstance(vertex_degrees, (list, tuple)):
-                vertex_degrees = (vertex_degrees, vertex_degrees)
-            filters += [GraphFilter(graph, 'vertex', 'degree', vertex_degrees)]
-
+        weights = weight.vertex_values() if weight is not None else None
         if filters:
-            if len(operators) != len(filters) - 1:
-                raise ValueError("Number of operators must be len(filters) - 1")
+            mask = combine_filters(filters, operators).as_mask('vertex')
+            vertices = vertices[mask]
+            if weights is not None:
+                weights = weights[mask]  # One weight per voxelized vertex
+        voxelize_branch_parameter.update(weights=weights)
 
-                # Start with the first atomic filter, then fold left
-            combined = filters[0]
-            for op_str, nxt in zip(operators, filters[1:]):
-                combined = combined.combine_with(nxt, op_str)
-            vertices = vertices[combined.as_mask('vertex')]
+        self.__voxelize(vertices, voxelize_branch_parameter, density_asset.path)
 
-        if weight_by_radius:
-            voxelize_branch_parameter.update(weights=graph.vertex_radii_units())
-
-        self.__voxelize(vertices, voxelize_branch_parameter)
-
-    def plot_voxelization(self, parent):
+    def plot_voxelization(self, parent, weight=None, vertex_degrees=None, filters=None, operators=None):
+        """Plot the density map that voxelize made with these weight, vertex_degrees, filters and operators"""
         from ClearMap.Visualization.Qt import Plot3d as q_p3d
-        return q_p3d.plot(self.get_path('density', channel=self.parent_channels, asset_sub_type='branches'),
-                          arrange=False, parent=parent, lut='flame')
+        filters, operators = self._with_degree_filter(None, vertex_degrees, filters, operators)
+        density_asset = self.density_asset(weight, filters, operators)
+        if not density_asset.exists:
+            raise AssetNotFoundError(f'No density map {density_asset.path.name}: '
+                                     f'run the voxelization with this weight and these filters first.',
+                                     asset_path=str(density_asset.path), asset_type='density')
+        return q_p3d.plot(density_asset.path, arrange=False, parent=parent, lut='flame')
 
     @requires_graph('traced')
     def write_vertex_table(self):
@@ -1532,19 +1625,19 @@ class VesselGraphProcessor(PipelineOrchestrator):
             df['radius_um'] = self.graph_traced.vertex_radii_units()
 
         if self.registration_processor.was_registered:
-            annotator = self.registration_processor.annotators[self.parent_channels[0]]
+            annotator = self.registration_processor.annotator_of(self.representative_channel)
             coordinates_transformed = self.graph_traced.vertex_property('coordinates_atlas')
             atlas_resolution = self.get_alignment_ref_channel_reg_cfg()['resampled_resolution']
             extra_columns = annotator.get_columns(coordinates_transformed, atlas_resolution,
                                                   self.graph_traced.vertex_property('annotation'))
             df = pd.concat([df, extra_columns], axis=1)
 
-        df.to_feather(self.get_path('vertices', channel=self.parent_channels, extension='.feather'))
+        df.to_feather(self.get_path('vertices', channel=self.compound_channel, extension='.feather'))
 
     @requires_graph('annotated')
     def get_structure_sub_graph(self, structure_id):
         # Assign label of requested structure to all its children
-        annotator = self.registration_processor.annotators[self.parent_channels[0]]
+        annotator = self.registration_processor.annotator_of(self.representative_channel)
         level = annotator.find(structure_id)['level']
         try:
             graph = self.graph_traced
@@ -1560,7 +1653,7 @@ class VesselGraphProcessor(PipelineOrchestrator):
         return graph.sub_graph(vertex_filter=vertex_filter)
 
     def plot_graph_structure(self, structure_id, plot_type):
-        annotator = self.registration_processor.annotators[self.parent_channels[0]]
+        annotator = self.registration_processor.annotator_of(self.representative_channel)
         structure_name = annotator.get_names_map()[structure_id]
         graph_chunk = self.get_structure_sub_graph(structure_id)
         if not graph_chunk:
@@ -1602,13 +1695,9 @@ class VesselGraphProcessor(PipelineOrchestrator):
                              f'available steps are "{self.steps.existing_steps}"')
         graph_chunk = graph.sub_slice(chunk_range)
         title = f'{graph_step.title()} Graph'
-        annotator = self.registration_processor.annotators[self.parent_channels[0]]
+        annotator = self.registration_processor.annotator_of(self.representative_channel)
         if graph_step == 'annotated':
             region_color = annotator.label_to_color(graph_chunk.vertex_annotation(), key='id', alpha=True, as_int=False)
         else:
             region_color = None
         return self.plot_graph_chunk(graph_chunk, plot_type, title, region_color, show)
-
-    def get_registration_sequence_channels(self):
-        return (self.registration_processor.
-                get_registration_sequence_channels(self.parent_channels[0], 'atlas'))

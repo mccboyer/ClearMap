@@ -1,4 +1,5 @@
 import math
+import warnings
 from typing import List, Optional
 
 import numpy as np
@@ -6,21 +7,23 @@ import pandas as pd
 
 from ClearMap.IO.workspace2 import Workspace2
 
-from ClearMap.Utils.exceptions import ClearMapValueError
+from ClearMap.Utils.exceptions import ClearMapValueError, ClearMapConfigError, ClearMapRuntimeError
 from ClearMap.Utils.utilities import sanitize_n_processes
 
 from ClearMap.config.config_coordinator import ConfigCoordinator
 
 from ClearMap.Analysis.Measurements import Voxelization as voxelization
-from ClearMap.Analysis.colocalization.channel import Channel as ColocalizationChannel
+from ClearMap.Analysis.colocalization.colocalization_channel_mask_components import ColocalizationChannelMaskComponents as ColocalizationChannel
 
-from ClearMap.pipeline_orchestrators.generic_orchestrators import CompoundChannelPipelineOrchestrator
+from ClearMap.pipeline_orchestrators.generic_orchestrators import (CompoundChannelPipelineOrchestrator,
+                                                                    PerCompoundConfigMixin, register_compound_channel)
 from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
 from ClearMap.pipeline_orchestrators.registration_orchestrator import RegistrationProcessor
 
 
-class ColocalizationProcessor(CompoundChannelPipelineOrchestrator):
+class ColocalizationProcessor(PerCompoundConfigMixin, CompoundChannelPipelineOrchestrator):
     colocalization_channels: dict[ColocalizationChannel]
+    pipeline = 'Colocalization'
     config_name = 'colocalization'
 
     def __init__(self, sample_manager: Optional[SampleManager] = None,
@@ -29,7 +32,6 @@ class ColocalizationProcessor(CompoundChannelPipelineOrchestrator):
                  registration_processor: Optional[RegistrationProcessor] = None):
         super().__init__(config_coordinator)
         self.sample_manager = sample_manager
-        self.channels: List[str] = channels
         self.registration_processor: Optional[RegistrationProcessor] = registration_processor
         self.workspace: Workspace2 | None = None
 
@@ -44,52 +46,93 @@ class ColocalizationProcessor(CompoundChannelPipelineOrchestrator):
         self.setup_finalised: bool = False
         self.setup(sample_manager, channels, registration_processor)
 
-    def setup(self, sample_manager: Optional[SampleManager], channel_names: tuple[str],
+    def setup(self, sample_manager: Optional[SampleManager] = None, channel_names: Optional[tuple[str, ...]] = None,
               registration_processor: Optional[RegistrationProcessor] = None):
-        self.channels = tuple(channel_names)
+        """
+        Register the pair of channels in the workspace once the sample is ready for it (see sample_ready),
+        then finalise: load what the comparison needs, when available. Idempotent, what is not given
+        (sample manager, channels, registration processor) is the one already set, so that it can be
+        called again, e.g. by setup_if_needed.
+        """
+        if channel_names is not None:
+            self.compound_channel = tuple(channel_names)
         if registration_processor is not None:
             self.registration_processor = registration_processor
         if sample_manager is not None:
             self.sample_manager = sample_manager
-            self.workspace = sample_manager.workspace
 
-            sample_id = self.sample_manager.sample_id
-            self.workspace.ensure_pipeline('Colocalization', channel_id=self.channels, sample_id=sample_id,
-                                           permute_channels=True, create_channel=True)
-
+        if self.sample_ready:
+            self.workspace = self.sample_manager.workspace
+            self.register_in_workspace()
+            self._setup_done = True
             self.finalise_setup()
+        else:
+            self._setup_done = False
+            warnings.warn(f'Sample not ready for the channels {self.compound_channel}, '
+                          f'ColocalizationProcessor setup incomplete')
+
+    def register_in_workspace(self) -> None:
+        """
+        The pair in both orientations: the results of either are computed by this processor
+        (the first channel is picked in the colocalization tab, see ColocalizationTab.sort_channels)
+        """
+        for oriented_pair in (self.compound_channel, self.compound_channel[::-1]):
+            register_compound_channel(self.sample_manager, self.pipeline, oriented_pair)
 
     def finalise_setup(self):
         if self.setup_finalised:
             return
-        finalised_channels = {chan: False for chan in self.channels}
-        for channel in self.channels:
-            resolution = self.sample_manager.get_channel_resolution(channel)
+        finalised_channels = {chan: False for chan in self.compound_channel}
+        for channel in self.compound_channel:
             try:
+                resolution = self.sample_manager.get_channel_resolution(channel)
                 self.colocalization_channels[channel] = ColocalizationChannel(
                     self.get('cells', channel=channel, asset_sub_type='shape').existing_path,
                     self.get_cells_df(channel),
                     voxel_dims=resolution)
                 finalised_channels[channel] = True
-            except FileNotFoundError as err:
+            except (FileNotFoundError, ClearMapConfigError) as err:  # Not detected yet, or resolution not set yet
                 print(f'Colocalization {err}')
                 self.setup_finalised = False
         self.setup_finalised = all(finalised_channels.values())
+
+    def setup_if_needed(self):
+        """Set up if not complete, and finalise if not done: the cells or the resolution may be there now"""
+        if not self.setup_complete or not self.setup_finalised:
+            self.setup()
+
+    def colocalization_channel(self, channel: str) -> ColocalizationChannel:
+        """
+        The object that computes the colocalization for one channel of the pair, finalising the setup
+        first if it was not possible earlier (see finalise_setup).
+
+        Raises
+        ------
+        ClearMapRuntimeError
+            If it is still not possible: the cells of the channel are not detected, or its resolution is not set.
+        """
+        self.finalise_setup()
+        if channel not in self.colocalization_channels:
+            raise ClearMapRuntimeError(f'Colocalization is not ready for channel "{channel}": the cells must be '
+                                       f'detected and the resolution set. Ready channels: '
+                                       f'{list(self.colocalization_channels)}.')
+        return self.colocalization_channels[channel]
 
     def get_cells_df(self, channel):
         return pd.read_feather(self.get_path('cells', channel=channel))
 
     def compute_colocalization(self, channel_a, channel_b):
+        self.sample_manager.check_pixel_aligned(channel_a, channel_b, require_stitched=True)  # Compared voxel for voxel
         # voxel_blob_diameter will also be used to compute the overlap
         voxel_blob_diameter = self.config['comparison']['particle_diameter']
         perf_cfg = self.cfg_coordinator.get_config_view(self.config_name)['performance']
         n_processes = sanitize_n_processes(perf_cfg['n_processes'])
 
-        report = self.colocalization_channels[channel_a].compare(self.colocalization_channels[channel_b],
-                                                                 blob_diameter=voxel_blob_diameter,
-                                                                 size_min=4*voxel_blob_diameter,
-                                                                 size_max=6*voxel_blob_diameter, #  FIXME: add control for size_max
-                                                                 processes=n_processes)
+        report = self.colocalization_channel(channel_a).compare(self.colocalization_channel(channel_b),
+                                                                blob_diameter=voxel_blob_diameter,
+                                                                size_min=4*voxel_blob_diameter,
+                                                                size_max=6*voxel_blob_diameter, #  FIXME: add control for size_max
+                                                                processes=n_processes)
         report_path = self.get_path('colocalization', channel=(channel_a, channel_b),
                                     asset_sub_type='report')
         report.reset_index(inplace=True)  # WARNING: extract the index (no drop) to a separate column to allow saving to feather
@@ -152,7 +195,7 @@ class ColocalizationProcessor(CompoundChannelPipelineOrchestrator):
                                                asset_sub_type='report'))  # TODO: see if we cache
         maximum_distance = self.config['analysis']['max_particle_distance']
         within_distance_mask = report['closest blob distance'].values < maximum_distance
-        chan_a = self.colocalization_channels[channel_a]
+        chan_a = self.colocalization_channel(channel_a)
         channel_a_particle_coordinates = report.loc[within_distance_mask, [f'center of bounding box {ax}'
                                                                            for ax in chan_a.coord_names]]
         channel_a_particle_coordinates.columns = list(chan_a.coord_names)
@@ -186,7 +229,7 @@ class ColocalizationProcessor(CompoundChannelPipelineOrchestrator):
         else:
             voxelization_parameter['shape'] = self.sample_manager.resampled_shape(channel_a)
         channel_a_particle_coordinates, _, _ = self.filter_table(channel_a, channel_b)
-        coordinates = channel_a_particle_coordinates[list(self.colocalization_channels[channel_a].coord_names)].values
+        coordinates = channel_a_particle_coordinates[list(self.colocalization_channel(channel_a).coord_names)].values
         return coordinates, voxelization_parameter
 
     def voxelize_unweighted(self, channel_a, channel_b, coordinates, voxelization_parameter):

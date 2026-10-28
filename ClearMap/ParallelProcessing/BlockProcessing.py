@@ -11,10 +11,11 @@ Example
 -------
 
 >>> import numpy as np
->>> import ClearMap.IO.IO as io
+>>> from ClearMap.IO import io_ops
+>>> from ClearMap.IO.source.backends.npy_backend import NumpySource
 >>> import ClearMap.ParallelProcessing.BlockProcessing as bp
->>> source = io.open_ro(np.asarray(np.random.rand(50,100,200), order = 'F'))
->>> blocks = bp.split_into_blocks(source, processes=10, axes=[2], size_min=30, size_max=50, overlap=20);
+>>> source = io_ops.open_ro(np.asarray(np.random.rand(50,100,200), order = 'F'))
+>>> blocks = bp.split_into_blocks(source, processes=10, axes=[2], size_min=30, size_max=50, overlap=20)
 >>> blocks[0]
 Block-Numpy-Source(50, 100, 38)[float64]|F|
 
@@ -24,7 +25,7 @@ Block-Numpy-Source(50, 100, 38)[float64]|F|
 >>> b.valid
 'Sliced-Block-Numpy-Source(50, 100, 28)[float64]|F|'
 
->>> b = blocks[0];
+>>> b = blocks[0]
 >>> print(b.valid.base_shape)
 >>> print(b.valid.base_slicing)
 >>> print(b.iteration)
@@ -32,47 +33,44 @@ Block-Numpy-Source(50, 100, 38)[float64]|F|
 (slice(None, None, None), slice(None, None, None), slice(None, 28, None))
 0
  
->>> shape = (2,3,20);
->>> source = io.npy.Source(array = np.random.rand(*shape));
->>> sink = io.npy.Source(array = np.zeros(shape))
+>>> shape = (2,3,20)
+>>> source = NumpySource(array = np.random.rand(*shape))
+>>> sink = NumpySource(array = np.zeros(shape))
 >>>  
 >>> def process_image(source, sink=None):
 >>>    if sink is None:
->>>      sink = np.zeros(source.shape);
->>>    sink[:] = 100 * source[:];
->>>    return sink;
+>>>      sink = np.zeros(source.shape)
+>>>    sink[:] = 100 * source[:]
+>>>    return sink
 >>> 
 >>> bp.process(process_image, source, sink,
->>>            processes = 'serial', size_max = 4, size_min = 1, overlap = 0, axes = [2],
->>>            optimization = True, verbose = True);
+>>>            processes = 0, size_max = 4, size_min = 1, overlap = 0, axes = [2],
+>>>            optimization = True, verbose = True)
 >>>
 >>> print(np.all(sink[:] == process_image(source)))
 True
   
 >>> bp.process(process_image, source, sink,
 >>>            processes = None, size_max = 10, size_min = 6, overlap = 3, axes = 'all',
->>>            optimization = True, verbose = True);
+>>>            optimization = True, verbose = True)
 
 """
 __author__    = 'Christoph Kirst <ckirst@rockefeller.edu>'
-__license__   = 'MIT License <http://www.opensource.org/licenses/mit-license.php>'
+__license__   = 'MIT License <https://www.opensource.org/licenses/mit-license.php>'
 __copyright__ = 'Copyright 2020 by Christoph Kirst'
 
 
 import functools as ft
-import multiprocessing as mp
 import warnings
+import gc
 
 import numpy as np
-import gc
 
 import ClearMap.ParallelProcessing.Block as blk
 import ClearMap.ParallelProcessing.ParallelTraceback as ptb
 
-import ClearMap.IO.IO as io
-import ClearMap.IO.SMA as sma
-
 import ClearMap.Utils.Timer as tmr
+from ClearMap.IO import source_initialization, io_ops
 
 #TODO: clean up block functions: act on sources, arrays or blocks + memory or views
 #TODO: integrate with Torch or tensorflow ? GPU processing ?
@@ -80,7 +78,7 @@ import ClearMap.Utils.Timer as tmr
 ###############################################################################
 ### Default parameter
 ###############################################################################
-from ClearMap.Utils.utilities import CancelableProcessPoolExecutor
+from ClearMap.Utils.utilities import CancelableProcessPoolExecutor, sanitize_n_processes
 
 default_size_max = None
 """Default maximal size of a block.
@@ -177,7 +175,7 @@ def process(function, source, sink = None,
   return_blocks : bool
     If True, return the block information used to distribute the processing.
   processes : int, None
-    The number of parallel processes, if 'serial', use serial processing.
+    The number of parallel processes, 0: in the calling process (no subprocess).
   verbose : bool
     Print information on sub-stack generation.
       
@@ -190,15 +188,17 @@ def process(function, source, sink = None,
   ----
   This implementation only supports processing into sinks with the same shape as the source.
   """
+  processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
+
   #sources and sinks
   if isinstance(source, list):
     sources = source
   else:
     sources = [source]
-  sources = [io.open_ro(s).as_virtual() for s in sources]
+  sources = [io_ops.open_ro(s).as_virtual() for s in sources]
 
-  #if sink is None:
-  #  sink = sma.Source(shape=sources[0].shape, dtype=sources[0].dtype, order=sources[0].order);
+  # if sink is None:
+  #     sink = SMASource(shape=sources[0].shape, dtype=sources[0].dtype, order=sources[0].order)
   if isinstance(sink, list):
     sinks = sink
   elif sink is None:
@@ -206,7 +206,7 @@ def process(function, source, sink = None,
   else:
     sinks = [sink]
 
-  sinks = [io.initialize(s, hint=sources[0]).as_virtual() for s in sinks]
+  sinks = [source_initialization.initialize(s, hint=sources[0]).as_virtual() for s in sinks]
 
   axes = block_axes(sources[0], axes=axes)
 
@@ -234,14 +234,13 @@ def process(function, source, sink = None,
   else:
     raise ValueError(f"function type {function_type} not 'array', 'source', 'block' or None!")
 
-  if not isinstance(processes, int) and processes != "serial":
-    processes = mp.cpu_count()
-
   if verbose:
     timer = tmr.Timer()
     print("Processing %d blocks with function %r." % (n_blocks, function.__name__))
 
-  if isinstance(processes, int):
+  if processes == 0:
+    result = [func(*args) for args in zip(source_blocks, sink_blocks)]  #analysis:ignore
+  else:
     #from bounded_pool_executor import BoundedProcessPoolExecutor
     #with BoundedProcessPoolExecutor(max_workers=processes) as executor:
     #   executor.map(function, source_blocks, sink_blocks)
@@ -260,8 +259,6 @@ def process(function, source, sink = None,
 
       if workspace is not None:
         workspace.executor = None
-  else:
-    result = [func(*args) for args in zip(source_blocks, sink_blocks)]  #analysis:ignore
 
   if verbose:
     timer.print_elapsed_time(f"Processed {n_blocks:d} blocks with function {function.__name__!r}")
@@ -408,12 +405,7 @@ def block_sizes(size, processes = None,
   the blocks over processes, assuming each block processes a similar amount of
   time.
   """
-  if processes is None:
-    processes = mp.cpu_count()
-  if not isinstance(processes, int):
-    processes = 1
-  if processes <= 0:
-    processes = 1
+  processes = sanitize_n_processes(processes)  # The calling process (0) is one
 
   if size_max is None or size_max > size: 
     size_max = size
@@ -596,7 +588,7 @@ def block_axes(source, axes=None):
       raise ValueError(f'Axes specification {axes} for source with dimension {source.ndim} not valid!')
     return axes
   
-  source = io.open_ro(source)  # metadata only
+  source = io_ops.open_ro(source)  # metadata only
   if source.order == 'F':
     axes = [source.ndim-1]
   else:
@@ -726,10 +718,13 @@ def _unpack(values, ndim = None):
 
 def _test():
   import numpy as np
-  import ClearMap.IO.IO as io
+  from ClearMap.IO import FileUtils as file_utils
+  from ClearMap.IO.source.backends.sma_backend import SMASource
+  from ClearMap.IO.source.backends.npy_backend import NumpySource
+  from ClearMap.IO.source.backends import mmp_backend
   import ClearMap.ParallelProcessing.BlockProcessing as bp
   
-  source = io.open_ro(np.asarray(np.random.rand(50,100,200), order = 'F'))
+  source = io_ops.open_ro(np.asarray(np.random.rand(50, 100, 200), order ='F'))
   
   blocks = bp.split_into_blocks(source, processes=10, axes=[2], size_min=30, size_max=50, overlap=20)
   print(blocks)
@@ -751,8 +746,8 @@ def _test():
   print(b.valid.base_slicing)
   
   shape = (2,3,20)
-  source = io.npy.Source(array = np.random.rand(*shape))
-  sink = io.npy.Source(array = np.zeros(shape))
+  source = NumpySource(array = np.random.rand(*shape))
+  sink = NumpySource(array = np.zeros(shape))
   
   def process_image(source, sink = None):
     if sink is None:
@@ -761,7 +756,7 @@ def _test():
     return sink
 
   bp.process(process_image, source, sink,
-             processes = 'serial', size_max = 4, size_min = 1, overlap = 0, axes = [2],
+             processes = 0, size_max = 4, size_min = 1, overlap = 0, axes = [2],
              optimization = True, verbose = True)
 
   print(np.all(sink[:] == process_image(source)))
@@ -778,9 +773,9 @@ def _test():
                               return_blocks = True, processes = None, verbose = True)
 
   #memmaps loading
-  source = io.mmp.create(location='source.npy', shape=shape)
+  source = mmp_backend.create(location='source.npy', shape=shape)
   source[:] = np.random.rand(*shape)
-  sink = io.mmp.create(location='sink.npy', shape=shape)
+  sink = mmp_backend.create(location='sink.npy', shape=shape)
   
   bp.process(process_image, source, sink,
              size_max = 10, size_min = 6, overlap = 3, axes = [2],
@@ -788,15 +783,15 @@ def _test():
 
   assert(np.all(sink[:] == process_image(source))) 
   
-  io.delete_file(source.location)
-  io.delete_file(sink.location)
+  file_utils.delete_file(source.location)
+  file_utils.delete_file(sink.location)
 
   #multiple sources and sinks
   shape = (2,50,30)
-  source1 = io.sma.Source(array = np.random.rand(*shape))
-  source2 = io.sma.Source(array = np.random.rand(*shape))
-  sink1 = io.sma.Source(array = np.zeros(shape))
-  sink2 = io.sma.Source(array = np.zeros(shape))
+  source1 = SMASource(array = np.random.rand(*shape))
+  source2 = SMASource(array = np.random.rand(*shape))
+  sink1 = SMASource(array = np.zeros(shape))
+  sink2 = SMASource(array = np.zeros(shape))
 
   def sum_and_difference(source1, source2, sink1 = None, sink2 = None):
     if sink1 is None:
@@ -819,8 +814,8 @@ def _test():
   
   #trace backs
   shape = (3,4)
-  source = io.sma.Source(array = np.random.rand(*shape))
-  sink = io.sma.Source(array = np.zeros(shape))
+  source = SMASource(array = np.random.rand(*shape))
+  sink = SMASource(array = np.zeros(shape))
   
   def raise_error(source, sink = None):
     raise RuntimeError('test')

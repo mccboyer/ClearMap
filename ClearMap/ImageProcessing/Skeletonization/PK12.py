@@ -31,7 +31,8 @@ import ClearMap.ParallelProcessing.DataProcessing.ConvolvePointList as cpl
 import ClearMap.Utils.Timer as tmr
 
 import ClearMap.IO.FileUtils as fu
-from ClearMap.Utils.utilities import sanitize_n_processes
+from ClearMap.IO import io_ops
+from ClearMap.Utils.utilities import sanitize_n_processes, available_cpu_count
 
 
 ###############################################################################
@@ -238,8 +239,8 @@ def match_non_removable(index, verbose = True):
 def generate_lookup_table(function = match_index, verbose = True):
   """Generates lookup table for templates"""
    
-  pool = mp.Pool(mp.cpu_count());
-  lut = pool.map(function, range(2**26),chunksize=2**26/8/mp.cpu_count())
+  pool = mp.Pool(available_cpu_count());
+  lut = pool.map(function, range(2**26),chunksize=2**26/8/available_cpu_count())
   lut = list(lut)
   
   return np.array(lut, dtype = bool);
@@ -630,8 +631,8 @@ def skeletonize_index(binary, points = None, steps = None, removals = False,
 ###############################################################################
 
 def _test():
-  import numpy as np;
-  import ClearMap.IO.IO as io
+  import numpy as np
+
   import ClearMap.Visualization.Plot3d as p3d
   import ClearMap.Tests.Files as tsf
   import ClearMap.ImageProcessing.Skeletonization.PK12 as PK12;
@@ -650,7 +651,7 @@ def _test():
   #Skeletonization
   reload(PK12)
   binary = tsf.skeleton_binary
-  binary_array = np.array(io.read(binary))
+  binary_array = np.array(io_ops.read(binary))
   
   #default version
   skeleton = PK12.skeletonize(binary_array.copy(), delete_border=True, verbose=True);

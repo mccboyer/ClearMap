@@ -7,18 +7,32 @@ All the classes that define parameters or group thereof for the tabs of the grap
 import functools
 import string
 import warnings
-from typing import List, Optional, Callable
+from typing import Callable, Iterable, List, Mapping, Optional
 
 import numpy as np
 
 from PyQt5.QtCore import Qt, QTimer, QSignalBlocker
 from PyQt5.QtWidgets import (QToolBox, QCheckBox, QLabel, QHBoxLayout, QVBoxLayout,
-                             QSpinBox, QLineEdit, QDoubleSpinBox, QRadioButton, QFrame)
+                             QSpinBox, QLineEdit, QDoubleSpinBox, QRadioButton, QFrame, QDialog, QButtonGroup,
+                             QMessageBox)
 
+from ClearMap.Analysis.graphs.graph_filters import GraphFilter, combined_filters_name
+from ClearMap.IO.FileUtils import FileRenameError, Rename, apply_renames
+from ClearMap.IO.channel_file_renaming import ChannelRenamePlan
+from ClearMap.Analysis.graphs.graph_weights import GraphWeight
 from ClearMap.config.atlas import ATLAS_NAMES_MAP
-from ClearMap.Utils.exceptions import ClearMapValueError
-from ClearMap.Utils.utilities import (validate_orientation, snake_to_title, set_item_recursive,
-                                      DEFAULT_ORIENTATION, trim_or_pad, REPLACE)
+from ClearMap.config.compound_keys import channel_file_name_token
+from ClearMap.config.config_coordinator import refuse_renames_onto_existing_channels
+from ClearMap.config.registration_channels import (ALIGN_WITH_NOTHING, ALIGN_WITH_UNDECIDED, ATLAS,
+                                                   INTRINSICALLY_ALIGNED, MOVING_OTHER, MOVING_SELF,
+                                                   NOT_SELECTED_FOR_REGISTRATION, REFERENCE_UNDECIDED,
+                                                   REGISTRATION_DIRECTIONS,
+                                                   partner_change, registration_direction)
+from ClearMap.Utils.exceptions import ChannelNameTakenError, ClearMapConfigError, ClearMapValueError
+from ClearMap.Utils.utilities import snake_to_title, trim_or_pad
+from ClearMap.config.config_adjusters.dict_ops import set_item_recursive
+from ClearMap.config.config_adjusters.patch_ops import REPLACE
+from ClearMap.config.orientation import validate_orientation, DEFAULT_ORIENTATION
 from ClearMap.Utils.event_bus import Publishes, EventBus
 from ClearMap.Utils.events import (UiChannelRenamed, UiCropChanged, UiOrientationChanged, UiRequestPlotAtlas,
                                    UiPrepareRawDataForClearMap, UiRequestPlotMiniBrain, UiChannelsChanged,
@@ -26,6 +40,8 @@ from ClearMap.Utils.events import (UiChannelRenamed, UiCropChanged, UiOrientatio
                                    UiRequestLandmarksDialog, UiAtlasIdChanged, UiAtlasStructureTreeIdChanged,
                                    UiVesselGraphFiltersChanged, UiBatchResultsFolderChanged, UiBatchGroupsChanged)
 
+from .dialogs import VerifyRenamingDialog
+from .exception_handler import handle_exception
 from .gui_utils_base import replace_widget
 from .params_mixins import OrthoviewerSlicingMixin
 from .pipeline_model import BINARIZATION_STEPS, PipelineStep, LinearPipeline
@@ -42,6 +58,45 @@ __license__ = 'GPLv3 - GNU General Public License v3 (see LICENSE.txt)'
 __copyright__ = 'Copyright © 2022 by Charly Rousseau'
 __webpage__ = 'https://idisco.info'
 __download__ = 'https://github.com/ClearAnatomics/ClearMap'
+
+NO_PARTNER_TEXT = 'None'  # The item of the align_with combo box for a channel which is not registered (config: None)
+UNDEFINED_LAYOUT_CHANNEL_TEXT = 'undefined'  # The item of the layout channel combo box when none is chosen (config: None)
+
+
+def align_with_choices(other_channels: Iterable[str]) -> list[str]:
+    """
+    The texts of the align_with combo box of a channel: not chosen yet (the token itself), not registered, the atlas,
+    the other channels. Texts only: None would be an empty item, which no partner is.
+    """
+    return [ALIGN_WITH_UNDECIDED, NO_PARTNER_TEXT, ATLAS, *other_channels]
+
+
+def align_with_to_ui(align_with: str | None) -> str:
+    """The text of the align_with combo box for the partner of the config: None (not registered) is an explicit item"""
+    return NO_PARTNER_TEXT if align_with is ALIGN_WITH_NOTHING else align_with
+
+
+def align_with_from_ui(text: str) -> str | None:
+    """The partner of the config for the text of the align_with combo box (the combo box getter gives None for it)"""
+    return ALIGN_WITH_NOTHING if text == NO_PARTNER_TEXT else text
+
+
+def reference_channel_choices(channels: Iterable[str]) -> list[str]:
+    """
+    The texts of the reference channel combo box: not chosen yet (the token itself), none ('None': no channel is
+    aligned with the atlas), the channels. Translated as the partner of a channel (align_with_to_ui and _from_ui).
+    """
+    return [REFERENCE_UNDECIDED, NO_PARTNER_TEXT, *channels]
+
+
+def layout_channel_to_ui(layout_channel: str | None) -> str:
+    """The text of the layout channel combo box for the layout channel of the config (None: none is chosen)"""
+    return layout_channel or UNDEFINED_LAYOUT_CHANNEL_TEXT
+
+
+def layout_channel_from_ui(text: str | None) -> str | None:
+    """The layout channel of the config for the text of the layout channel combo box: None if none is chosen"""
+    return None if text == UNDEFINED_LAYOUT_CHANNEL_TEXT else text
 
 
 class NProcessesParams(UiParameter):
@@ -167,8 +222,7 @@ class SampleChannelParameters(ChannelUiParameter):
 
     def connect(self):
         def _on_name_editing_finished():
-            channels_tab_w = self.tab.parent().parent()  #  n+1 is "qt_tabwidget_stackedwidget"
-            old_name = channels_tab_w.tabText(self.page_index)  # still the old name at this time
+            old_name = self.name  # the channel of this page, not the tab at an index which may have moved
             new_name = self.nameWidget.text().strip()
             if not new_name or new_name == old_name:
                 return
@@ -195,9 +249,10 @@ class SampleChannelParameters(ChannelUiParameter):
     @param_setter
     def orientation(self, orientation):  # FIXME: only when all 3 are set
         orientation = self.validate_orientation(orientation)
-        self.tab.orientXSpinBox.setValue(orientation[0])
-        self.tab.orientYSpinBox.setValue(orientation[1])
-        self.tab.orientZSpinBox.setValue(orientation[2])
+        for spin_box, value in zip((self.tab.orientXSpinBox, self.tab.orientYSpinBox, self.tab.orientZSpinBox),
+                                   orientation):
+            with QSignalBlocker(spin_box):  # Painting the config is not an edit: the handler has nothing to do
+                spin_box.setValue(value)
 
     def validate_orientation(self, orientation):
         return validate_orientation(orientation, self.name, raise_error=False)
@@ -242,7 +297,16 @@ class SampleParameters(ChannelsUiParameterCollection):
 
     cfg_subtree = ['sample']
 
-    def __init__(self, tab, *, event_bus: EventBus, get_view=None, apply_patch=None):
+    def __init__(self, tab, *, event_bus: EventBus,
+                 plan_file_renames: Callable[[Mapping[str, str]], ChannelRenamePlan], get_view=None, apply_patch=None):
+        """
+        Parameters
+        ----------
+        plan_file_renames : Callable[[Mapping[str, str]], ChannelRenamePlan]
+            The files to rename with the channels, by the new name of each renamed channel (by old name), planned
+            before the rename (e.g. :meth:`ExperimentController.plan_channel_file_renames`).
+        """
+        self._plan_file_renames = plan_file_renames
         self.shared_sample_params = SharedSampleParams(tab, event_bus=event_bus,
                                                        get_view=get_view, apply_patch=apply_patch)
         self._last_channels: Optional[List[str]] = None
@@ -312,10 +376,13 @@ class SampleParameters(ChannelsUiParameterCollection):
                                       requester: SampleChannelParameters) -> None:
         """
         Orchestrate rename:
+          0. Ask the user to vet the renaming of the files of the channel (if it has any); cancelling it
+             cancels the rename
           1. Update parent-owned state (dict key, tab text) so synchronous
              cascade sees consistent state
           2. Ask child to write its config
-          3. Verify and revert on failure
+          3. Verify; on failure, revert and tell the user why
+          4. Rename the files the user kept
 
         Parameters
         ----------
@@ -331,38 +398,85 @@ class SampleParameters(ChannelsUiParameterCollection):
             warnings.warn(f'Cannot rename {old_name!r}: not in channel_params')
             return
 
-        tab_widget = self.tab.channelsParamsTabWidget
-        page_idx = requester.page_index
+        # The rule of the config, applied before this dict changes: it would lose the params of the other channel
+        try:
+            refuse_renames_onto_existing_channels({old_name: new_name}, self.channels)
+        except ChannelNameTakenError as err:
+            requester.show_name()  # Its name field holds the text typed over it
+            handle_exception(err, parent=self.tab, context=f'Rename {old_name!r} → {new_name!r}')
+            return
 
-        # 1. Parent updates its own state (dict key + tab text)
+        # 0. Planned under the old names (the files, the workspace and the registration config still use them)
+        try:
+            file_renames = self._vet_file_renames(old_name, new_name)
+        except Exception as err:  # E.g. an inconsistent registration config: not renamed without its files
+            requester.show_name()
+            handle_exception(err, parent=self.tab, context=f'The renaming of the files of {old_name!r} cannot be '
+                                                           f'planned: the channel keeps its name')
+            return
+        if file_renames is None:  # The user cancelled: the channel keeps its name
+            requester.show_name()
+            return
+
+        # 1. Parent updates its own state (dict key). The requester's name (tab text and name field) is set
+        #    through its page, never through an index which may be stale
         self.channel_params[new_name] = self.channel_params.pop(old_name)
-        tab_widget.setTabText(page_idx, new_name)
+        requester.name = new_name
 
         # 2. Child writes config (may fail, but parent already updated, so we can revert to consistent state)
         try:
             requester.handle_name_changed(old_name, new_name)
-        except Exception as e:
-            self._revert_rename(old_name, new_name, page_idx, tab_widget, requester)
-            warnings.warn(f'Channel rename {old_name!r}→{new_name!r} failed: {e}')
+        except Exception as err:
+            self._refuse_rename(old_name, new_name, requester, err)
             return
 
         # 3. Verify config accepted it
         if new_name not in self.config_channels:
-            self._revert_rename(old_name, new_name, page_idx, tab_widget, requester)
-            warnings.warn(f'Channel rename {old_name!r}→{new_name!r} rejected by coordinator.')
+            err = ClearMapValueError(f'The config did not accept the name {new_name!r} for the channel {old_name!r}.')
+            self._refuse_rename(old_name, new_name, requester, err)
             return
 
         # 4. Success
         self._publish_channels_changed(self.config_channels)
+        self._rename_files(old_name, new_name, file_renames)
 
-    def _revert_rename(self, old_name: str, new_name: str, page_idx: int,
-                       tab_widget, requester: SampleChannelParameters) -> None:
+    def _vet_file_renames(self, old_name: str, new_name: str) -> list[Rename] | None:
+        """
+        The renames of the files of the channel, as vetted by the user. None if the user cancelled (the channel
+        keeps its name), empty if the channel has no file.
+        """
+        plan = self._plan_file_renames({old_name: new_name})
+        if not plan:
+            return []
+        dialog = VerifyRenamingDialog(plan.renames, not_renamed=plan.not_renamed,
+                                      title=f'Rename the channel {old_name!r} to {new_name!r}',
+                                      message=f'The files of the channel {old_name!r} are named after it. Unless '
+                                              f'they are renamed too, the pipeline does not find them under the '
+                                              f'name {new_name!r}. Untick a file to leave it as it is.',
+                                      accept_text='Rename the channel and its files', parent=self.tab)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.selected_renames
+
+    def _rename_files(self, old_name: str, new_name: str, file_renames: list[Rename]) -> None:
+        """Rename the files of the renamed channel. If it fails, they keep their old names: tell the user"""
+        try:
+            apply_renames(file_renames)
+        except FileRenameError as err:
+            handle_exception(err, parent=self.tab,
+                             context=f'The channel {old_name!r} is renamed to {new_name!r} but its files keep '
+                                     f'their old names')
+
+    def _refuse_rename(self, old_name: str, new_name: str, requester: SampleChannelParameters,
+                       reason: Exception) -> None:
+        """Put the old name back (params, page, name field), then tell the user why it was refused"""
+        self._revert_rename(old_name, new_name, requester)
+        handle_exception(reason, parent=self.tab, context=f'Rename {old_name!r} → {new_name!r}')
+
+    def _revert_rename(self, old_name: str, new_name: str, requester: SampleChannelParameters) -> None:
         """Handle failed rename attempt (e.g. refused by coordinator)"""
         self.channel_params[old_name] = self.channel_params.pop(new_name, None)
-        tab_widget.setTabText(page_idx, old_name)
-        requester.nameWidget.blockSignals(True)
-        requester.nameWidget.setText(old_name)
-        requester.nameWidget.blockSignals(False)
+        requester.name = old_name
 
     def _bind_channel_signals(self, channel_params: "SampleChannelParameters"):
         def get_current_index():
@@ -522,12 +636,13 @@ class StitchingParams(ChannelsUiParameterCollection):
 
     def add_channel(self, channel_name, data_type=None):
         """
-        Add a channel to the stitching parameters if not already present.
+        Create the stitching parameters of a channel (if not already present)
+        from its entry in the config.
 
         .. warning::
-            This only adds the channel to the config — it **does not**
-            create the UI elements.  UI creation is handled by the tab's
-            ``add_channel_tab()`` method.
+            This **does not** write the config: the config adjusters create the entry
+            of every stitchable channel. It does not create the UI elements either:
+            UI creation is handled by the tab's ``add_channel_tab()`` method.
 
         Parameters
         ----------
@@ -538,8 +653,6 @@ class StitchingParams(ChannelsUiParameterCollection):
         if channel_name in self.channels:
             return
         else:
-            if channel_name not in self.view['channels'].keys():
-                self._update_value(['channels', channel_name], {})  # Adjuster fills w/ defaults
             self.reconcile_children_from_view()  # ensure param object created
 
     def reconcile_children_from_view(self, *_):
@@ -563,14 +676,13 @@ class StitchingParams(ChannelsUiParameterCollection):
             tw = self.tab.channelsParamsTabWidget
             page = tw.get_channel_widget(ch)
             if page is not None:  # Skip (defer) otherwise
-                self.channel_params[ch] = ChannelStitchingParams(self.tab, ch, event_bus=self._bus,
-                                                                 get_view=self._get_view,
-                                                                 apply_patch=self._apply_patch)
+                self[ch] = ChannelStitchingParams(self.tab, ch, event_bus=self._bus, get_view=self._get_view,
+                                                  apply_patch=self._apply_patch)
 
     def prune_obsolete_channels(self, desired_channels: tuple):
         for ch in list(self.channel_params.keys()):
             if ch not in desired_channels:
-                self.channel_params.pop(ch)
+                self.drop_channel(ch)
 
     def handle_layout_channel_changed(self, channel, layout_channel):
         self.publish(UiLayoutChannelChanged(channel_name=channel, layout_channel=layout_channel))
@@ -709,8 +821,8 @@ class GeneralChannelStitchingParams(ChannelUiParameter):
                     UiLayoutChannelChanged(channel_name=self.name,
                                            layout_channel=self.layout_channel)),
                 # extra_connect=self.refresh_layout_channel_items,
-                cast_to_ui=lambda v: v or '',   # show empty when unset
-                cast_from_ui = lambda s: None if (s in ('', 'undefined')) else s  ),  #TEST:
+                cast_to_ui=layout_channel_to_ui,
+                cast_from_ui=layout_channel_from_ui),
             'use_existing_layout': ParamLink(
                 ['use_existing_layout'], self.tab.useExistingLayoutCheckBox, default=False,
                 missing_ok=True,  # WARNING: only if self.layout_channel != self.name
@@ -719,8 +831,9 @@ class GeneralChannelStitchingParams(ChannelUiParameter):
                     UiUseExistingLayoutChanged(channel_name=self.name, use_existing=self.use_existing_layout)))
         }
 
-    def _existing_layout_relevant(self, v: dict) -> bool:
-        return v.get('stitching', {}).get('layout_channel') == self.name
+    def _existing_layout_relevant(self, view: dict) -> bool:
+        """Only a channel which is its own layout channel computes a layout, so can reuse an existing one"""
+        return view.get('layout_channel') == self.name
 
     @property
     def run(self):
@@ -746,9 +859,9 @@ class GeneralChannelStitchingParams(ChannelUiParameter):
         current = layout_combobox.currentText()
         layout_combobox.blockSignals(True)  # No update during refresh
         layout_combobox.clear()
-        layout_combobox.addItems(['undefined'] + channel_names)
+        layout_combobox.addItems([UNDEFINED_LAYOUT_CHANNEL_TEXT] + channel_names)
         # reselect current value if still valid (else explicit 'undefined')
-        layout_combobox.setCurrentText(current if current in channel_names else 'undefined')
+        layout_combobox.setCurrentText(current if current in channel_names else UNDEFINED_LAYOUT_CHANNEL_TEXT)
         layout_combobox.blockSignals(False)
 
 
@@ -789,11 +902,34 @@ class RigidChannelStitchingParams(ChannelUiParameter):
     def cfg_subtree(self):
         return ['stitching', 'channels', self.name, 'rigid']   # REFACTOR: section name from config_handler
 
+    OVERLAP_ATTRS = ('x_overlap', 'y_overlap')
+
     def set_visible(self, state):
         self.tab.rigidParamsGroupBox.setVisible(state)
 
     def set_enabled(self, state):
         self.tab.rigidParamsGroupBox.setEnabled(state)
+
+    def set_auto_overlap_allowed(self, allowed: bool, reason: str = '') -> None:
+        """
+        Allow or forbid the 'auto' overlap (read from the OME metadata of the tiles).
+
+        When forbidden (tiles without OME metadata), the overlap global toggle is forced on
+        (i.e. manual values) and locked. If the config still holds 'auto', the value shown in
+        the spinboxes (the default on enable) is written to the config so that the UI and config agree.
+        When allowed again, the toggle is simply unlocked (the current value is kept).
+        """
+        for attr in self.OVERLAP_ATTRS:
+            link = self.params_dict[attr]
+            check_box = link.widget.getCheckBox()
+            if check_box is None:
+                continue
+            if not allowed and not check_box.isChecked():
+                with self._suppress_handlers():  # Do not patch the config for the toggle itself
+                    check_box.setChecked(True)
+                self._emit_patch(link.keys, getattr(self, attr))  # Now UI == config, no silent mismatch
+            check_box.setEnabled(allowed)
+            check_box.setToolTip('' if allowed else reason)
 
 
 class WobblyChannelStitchingParams(ChannelUiParameter):
@@ -833,12 +969,20 @@ class WobblyChannelStitchingParams(ChannelUiParameter):
 
 
 class ChannelRegistrationParams(ChannelUiParameter):
+    """
+    The registration of a channel. Its direction (moving_channel) is chosen with radio buttons, relative to the channel
+    (see registration_channels): they are painted from the config after the linked widgets (cfg_to_ui) and only
+    available once the channel has a partner (align_with).
+    """
     publishes = Publishes(UiAlignWithChanged)
 
     def __init__(self, tab, channel_name, *, event_bus: EventBus, get_view=None, apply_patch=None):
         super().__init__(tab, channel_name, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
         self.tab.landmarksWeightsPanel = LandmarksWeightsPanel(self.tab)
         self.tab.landmarksWeightsLayout.addWidget(self.tab.landmarksWeightsPanel)
+        self._direction_buttons = QButtonGroup(self.tab)
+        for button in self._direction_radio_buttons.values():
+            self._direction_buttons.addButton(button)
 
         self.handle_params_files_changed()  # Initial setup
 
@@ -847,11 +991,10 @@ class ChannelRegistrationParams(ChannelUiParameter):
             'resample': ParamLink(['resample'], self.tab.resampleCheckBox),
             'resampled_resolution': ParamLink(['resampled_resolution'], self.tab.resampleResolutionTriplet),
             'align_with': ParamLink(['align_with'], self.tab.alignWithComboBox,
-                                    cast_to_ui=lambda v: 'None' if v is None else v,
-                                    cast_from_ui=lambda v: None if v == 'None' else v,
-                                    notify_apply=lambda: self.publish(
-                                        UiAlignWithChanged(channel_name=self.name, align_with=self.align_with))),
-            'moving_channel': ParamLink(['moving_channel'], self.tab.movingChannelComboBox),
+                                    cast_to_ui=align_with_to_ui,
+                                    cast_from_ui=align_with_from_ui,
+                                    connect=self.handle_align_with_edited),
+            # moving_channel: the direction radio buttons (see _paint_direction and handle_direction_toggled)
             # WARNING: broken by class replacement
             'params_files': ParamLink(['params_files'], self.tab.paramsFilesListWidget,
                                       object_name='paramsFilesListWidget', scope_root=self.tab),
@@ -877,6 +1020,71 @@ class ChannelRegistrationParams(ChannelUiParameter):
         if hasattr(self.tab, 'landmarksWeightsPanel'):
             self.tab.landmarksWeightsPanel.weightAtChanged.connect(
                 self.handle_landmarks_weight_changed)
+        for direction, button in self._direction_radio_buttons.items():
+            button.toggled.connect(functools.partial(self.handle_direction_toggled, direction))
+
+    @property
+    def _direction_radio_buttons(self) -> dict[str, QRadioButton]:
+        """The radio button of each direction (moving_channel)"""
+        return {MOVING_OTHER: self.tab.movingOtherRadioButton,
+                INTRINSICALLY_ALIGNED: self.tab.intrinsicallyAlignedRadioButton,
+                MOVING_SELF: self.tab.movingSelfRadioButton}
+
+    def cfg_to_ui(self):
+        super().cfg_to_ui()
+        self._paint_direction()
+
+    def _paint_direction(self) -> None:
+        """
+        Check the radio button of the direction of the config, named after the channel and its partner. Without a
+        partner they are disabled (the direction is kept, it is used again with the next partner).
+        """
+        view = self.view
+        align_with = view.get('align_with')
+        moving_channel = view.get('moving_channel')
+        has_partner = align_with not in NOT_SELECTED_FOR_REGISTRATION
+        try:
+            direction = registration_direction(self.name, view)
+        except ClearMapConfigError:  # A name left over from another partner: none is checked, the registration says why
+            direction = None
+        if direction is None and moving_channel in REGISTRATION_DIRECTIONS:
+            direction = moving_channel
+        partner = align_with if has_partner else 'the partner'
+        texts = {MOVING_OTHER: f'{partner} moves onto {self.name}',
+                 INTRINSICALLY_ALIGNED: f'Acquired together with {partner}',
+                 MOVING_SELF: f'{self.name} moves onto {partner}'}
+        self._painting = True
+        try:
+            self._direction_buttons.setExclusive(False)  # So that none is checked when there is no direction
+            for button_direction, button in self._direction_radio_buttons.items():
+                button.setText(texts[button_direction])
+                button.setChecked(button_direction == direction)
+            self._direction_buttons.setExclusive(True)
+            self.tab.movingDirectionFrame.setEnabled(has_partner)
+        finally:
+            self._painting = False
+
+    def handle_direction_toggled(self, direction: str, checked: bool) -> None:
+        if self._painting or not checked:
+            return
+        self._emit_patch(['moving_channel'], direction)
+        if direction == MOVING_SELF:
+            QMessageBox.warning(self.tab, 'Registration computed the other way round',
+                                f'{self.name} will be registered onto {self.view.get("align_with")}. Images can be '
+                                f'transformed through it, but transforming the points of {self.name} (cells, '
+                                f'tracts, vessels) needs the inverse transform, which is not supported yet: their '
+                                f'coordinates would be wrong.')
+
+    def handle_align_with_edited(self, *_) -> None:
+        """
+        The partner is changed in its combo box: written with the direction, relative to the channel (a new partner
+        moves onto the channel unless a direction was chosen, see :func:`partner_change`).
+        """
+        if self._painting:
+            return
+        align_with = self.align_with
+        self._emit_patch([], partner_change(self.name, self.view, align_with))
+        self.publish(UiAlignWithChanged(channel_name=self.name, align_with=align_with))
 
     @property
     def params_files(self):
@@ -905,52 +1113,27 @@ class ChannelRegistrationParams(ChannelUiParameter):
             return snake_to_title(base)
         params_files_with_ext = self.tab.paramsFilesListWidget.get_items_text()
         new_params_files = [file_name_to_title(p) for p in params_files_with_ext]
-        # Now match length of weights (prune or pad with 0)
+        # Now match length of weights (prune or pad with 0). Slider values (percents) in the config too
         new_weights = trim_or_pad(self.view['landmarks_weights'], len(new_params_files), pad_value=0)
 
         self.tab.landmarksWeightsPanel.set_items(new_params_files, new_weights)
 
         patch = {}
         set_item_recursive(patch, self.cfg_subtree + ['params_files'], params_files_with_ext)
-        scaled_weights = [self.scale_landmarks(w) for w in new_weights]
-        set_item_recursive(patch, self.cfg_subtree + ['landmarks_weights'], scaled_weights)
+        set_item_recursive(patch, self.cfg_subtree + ['landmarks_weights'], new_weights)
         self._apply_patch(patch)
 
     @param_handler  # FIXME: check
     def handle_landmarks_weight_changed(self, idx: int, value: int):
-        scaled = self.scale_landmarks(value)
         new_weights = self.view['landmarks_weights'][:]
         if idx == len(new_weights):
-            new_weights.append(scaled)
+            new_weights.append(value)
         elif idx < len(new_weights):
-            new_weights[idx] = scaled
+            new_weights[idx] = value
         else:
             raise ValueError(f'Index {idx} out of bounds for channel {self.name} '
                              f'landmarks weights {self.view["landmarks_weights"]}')
         self._update_value(['landmarks_weights'], new_weights)
-
-    @staticmethod
-    def scale_landmarks(value: int):
-        """
-        Scale the weight of the landmarks using an exponential function so that
-        the ratio between the weights follows a geometric progression with the slider value
-
-        Parameters
-        ----------
-        value: int
-            The value of the slider (between 0 and 100)
-
-        Returns
-        -------
-        float
-            The scaled weight (between 0 and max_ratio)
-        """
-        if value == 0:
-            return 0
-        else:
-            min_ratio = 1 / 20000
-            max_ratio = 200
-            return min_ratio * (max_ratio / min_ratio) ** (value / 100)
 
 
 class SharedRegistrationParams(UiParameter):
@@ -961,6 +1144,19 @@ class SharedRegistrationParams(UiParameter):
         }
 
 
+class ReferenceChannelParams(UiParameter):
+    """The reference channel of the registration (registration.reference_channel), chosen in the tab"""
+    reference_channel: str | None
+
+    def __init__(self, tab, *, event_bus: EventBus, get_view=None, apply_patch=None):
+        self.cfg_subtree = ['registration']  # REFACTOR: section name from config_handler
+        super().__init__(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
+
+    def build_params_dict(self):
+        return {'reference_channel': ParamLink(['reference_channel'], self.tab.referenceChannelComboBox,
+                                               cast_to_ui=align_with_to_ui, cast_from_ui=align_with_from_ui)}
+
+
 class RegistrationParams(ChannelsUiParameterCollection):  # TEST: does not seem to follow tab click
     publishes = Publishes(UiRequestLandmarksDialog)   # Bind by number because name may change
 
@@ -968,6 +1164,8 @@ class RegistrationParams(ChannelsUiParameterCollection):  # TEST: does not seem 
         super().__init__(tab, pipeline_name='Registration', event_bus=event_bus,
                          get_view=get_view, apply_patch=apply_patch)
         self.atlas_params = AtlasParams(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
+        self.reference_channel_params = ReferenceChannelParams(tab, event_bus=event_bus, get_view=get_view,
+                                                               apply_patch=apply_patch)
         self.shared_params = SharedRegistrationParams(tab, event_bus=event_bus,
                                                      get_view=get_view, apply_patch=apply_patch)
 
@@ -975,17 +1173,19 @@ class RegistrationParams(ChannelsUiParameterCollection):  # TEST: does not seem 
         if channel_name in self.channels:
             return
         else:
-            self._update_value(['channels', channel_name], {})  # To be materialized w/ defaults
             channel_params = ChannelRegistrationParams(self.tab, channel_name, event_bus=self._bus,
                                                         get_view=self._get_view, apply_patch=self._apply_patch)
             self[channel_name] = channel_params
             channel_params.tab.selectLandmarksPushButton.clicked.connect(
-                lambda ch_idx=channel_params.page_index: self.publish(
-                    UiRequestLandmarksDialog(page_index=ch_idx)))
+                functools.partial(self.request_landmarks_dialog, channel_params))
+
+    def request_landmarks_dialog(self, channel_params, *_checked):  # *_checked: the button passes its checked state
+        """Ask for the landmarks dialog of the channel, by the index its page has now (its name may change)"""
+        self.publish(UiRequestLandmarksDialog(page_index=channel_params.page_index))
 
     @property
     def params(self):
-        return [self.atlas_params, self.shared_params] + list(self.values())
+        return [self.atlas_params, self.reference_channel_params, self.shared_params] + list(self.values())
 
     def get_channel_name(self, channel_idx):
         return self.tab.channelsParamsTabWidget.tabText(channel_idx)
@@ -1002,7 +1202,6 @@ class AtlasParams(UiParameter):
         self.atlas_info = ATLAS_NAMES_MAP
         self.cfg_subtree = ['registration', 'atlas']  # REFACTOR: section name from config_handler
         super().__init__(tab, event_bus=event_bus, get_view=get_view, apply_patch=apply_patch)
-        self.update_atlas_resolution()  # WARNING: after connect
 
     def build_params_dict(self):
         return {
@@ -1021,12 +1220,25 @@ class AtlasParams(UiParameter):
     def connect(self):
         self.tab.atlasResolutionTriplet.valueChangedConnect(self.handle_atlas_resolution_changed)  # TODO: replace with label
 
+    def cfg_to_ui(self):
+        super().cfg_to_ui()
+        # The atlas combo box is set silently from the config:
+        #   show the resolution of the atlas it now holds not the combo box default
+        self.update_atlas_resolution()
+
+    @property
+    def _atlas_entry(self) -> dict:
+        """The ATLAS_NAMES_MAP entry of the atlas selected in the combo box"""
+        if self.atlas_id not in self.atlas_info:
+            raise ClearMapValueError(f'Unknown atlas "{self.atlas_id}", known atlases: {list(self.atlas_info)}')
+        return self.atlas_info[self.atlas_id]
+
     def update_atlas_resolution(self):
-        self.tab.atlasResolutionTriplet.setValue([self.atlas_info[self.atlas_id]['resolution']] * 3)
+        self.tab.atlasResolutionTriplet.setValue([self._atlas_entry['resolution']] * 3)
 
     @property
     def atlas_base_name(self):
-        return self.atlas_info[self.atlas_id]['base_name']
+        return self._atlas_entry['base_name']
 
     @param_handler  # FIXME: check
     def handle_atlas_resolution_changed(self, state):
@@ -1058,7 +1270,6 @@ class CellMapParams(ChannelsUiParameterCollection):
 
     def add_channel(self, channel_name, data_type=None):
         if channel_name not in self.keys():
-            self._update_value(['channels', channel_name], {})  # To be materialized w/ defaults
             dtype = np.uint16  # FIXME: read from stitched file
             self[channel_name] = ChannelCellMapParams(self.tab, channel_name, main_params=self,
                                                       event_bus=self._bus, dtype=dtype,
@@ -1075,14 +1286,12 @@ class CellMapParams(ChannelsUiParameterCollection):
             self.tab, channel_name, event_bus=self._bus,
             get_view=self._get_view, apply_patch=self._apply_patch)
 
-    def pop(self, channel_name: str):
+    def drop_channel(self, channel_name: str):
         # tear down both algo + perf params
-        if channel_name in self:
-            self[channel_name].teardown()
-            super().pop(channel_name)
         if channel_name in self._perf_params:
             self._perf_params[channel_name].teardown()
             del self._perf_params[channel_name]
+        return super().drop_channel(channel_name)
 
 
 class ChannelCellMapParams(ChannelUiParameter, OrthoviewerSlicingMixin):
@@ -1211,7 +1420,6 @@ class TractMapParams(ChannelsUiParameterCollection):
 
     def add_channel(self, channel_name, data_type=None):
         if channel_name not in self.channels:
-            self._update_value(['channels', channel_name], {})
             self[channel_name] = ChannelTractMapParams(self.tab, channel_name, main_params=self, event_bus=self._bus,
                                                        get_view=self._get_view, apply_patch=self._apply_patch)
 
@@ -1317,7 +1525,6 @@ class ColocalizationParams(ChannelsUiParameterCollection):
         if channel_name in self.keys():
             return
         else:
-            self._update_value(['channels', channel_name], {})  # Will be materialized w/ defaults
             self[channel_name] = ChannelColocalizationParams(self.tab, channel_name, main_params=self,
                                                              event_bus=self._bus, get_view=self._get_view,
                                                              apply_patch=self._apply_patch)
@@ -1338,7 +1545,9 @@ class ChannelColocalizationParams(ChannelUiParameter):
         return {
             'particle_diameter': ParamLink(['comparison', 'particle_diameter'],
                                            self.tab.colocalizationDiameterSpinBox),
-            'n_processes': ParamLink(['performance', 'n_processes'], self.tab.colocalizationNProcessesSpinBox),
+            # performance is top level subsection, not per chan
+            'n_processes': ParamLink(['performance', 'n_processes'],
+                                     self.tab.colocalizationNProcessesSpinBox, section_level=True),
             'max_particle_distance': ParamLink(['analysis', 'max_particle_distance'],
                                                self.tab.colocalizationMaxDistanceSpinBox),
             'relative_overlap_threshold': ParamLink(['analysis', 'relative_overlap_threshold'],
@@ -1411,7 +1620,6 @@ class VesselParams(ChannelsUiParameterCollection):
         if channel_name in self.channels:
             return
         else:
-            self._update_value(['binarization', 'single_channels', channel_name], {})  # Will be materialized w/ defaults)
             self[channel_name] = VesselBinarizationParams(self.tab, channel_name, event_bus=self._bus,
                                                             get_view=self._get_view, apply_patch=self._apply_patch)
 
@@ -1431,15 +1639,15 @@ class VesselParams(ChannelsUiParameterCollection):
             self.tab, channel_name, event_bus=self._bus,
             get_view=self._get_view, apply_patch=self._apply_patch)
 
-    def pop(self, channel_name: str):
+    def drop_channel(self, channel_name: str):
         # tear down both algo + perf params
-        if channel_name in self:
-            self[channel_name].teardown()
-            super().pop(channel_name)
-            self.shared_binarization_params.set_plotable_channels(self.channels)
         if channel_name in self._perf_params:
             self._perf_params[channel_name].teardown()
             del self._perf_params[channel_name]
+        popped_channel = super().drop_channel(channel_name)
+        if popped_channel is not None:
+            self.shared_binarization_params.set_plotable_channels(self.channels)
+        return popped_channel
 
 
 class VesselBinarizationParams(ChannelUiParameter):
@@ -1698,23 +1906,29 @@ class VesselGraphParams(UiParameter):
         self.filter_params.append(GraphFilterParams(main_params=self, widget=widget,
                                                     graph=graph, event_bus=self._bus,
                                                     get_view=self._get_view, apply_patch=self._apply_patch))
-        self.filtersChanged.emit()
+        self.notify_filters_changed()
+
+    def notify_filters_changed(self) -> None:
+        self.publish(UiVesselGraphFiltersChanged())
 
     @property
     def n_filters(self):
         return len(self.filter_params)
 
-    def compute_filter_suffix(self):
-        suffix = '_'.join([f'{f.property_name}_{f.get_property_value()}' for f in self.filter_params])
-        # TODO: consider:
-        #   parts = []
-        #   for i, f in enumerate(fs):
-        #       parts.append(f"{f.property_name}_{f.get_property_value()}")
-        #       op = f.combine_operator_name
-        #       if op and i < len(fs)-1:
-        #           parts.append(op)
-        #   suffix = '_'.join(parts)
-        return suffix
+    def graph_filters(self, graph) -> list[GraphFilter]:
+        """The filters set in the UI, applied to graph (None is enough to name them)"""
+        return [GraphFilter(graph, filter_type=f.filter_type, property_name=f.property_name,
+                            property_value=f.get_property_value())
+                for f in self.filter_params]
+
+    @property
+    def combine_operators(self) -> list[str]:
+        """The operator after each filter but the last one (which has no combine buttons)"""
+        return [f.combine_operator_name for f in self.filter_params[:-1]]
+
+    def compute_filter_suffix(self) -> str:
+        """The filters part of the density file name (see VesselGraphProcessor.density_asset)"""
+        return combined_filters_name(self.graph_filters(graph=None), self.combine_operators)
 
 
 class VesselGraphPerformanceParams(UiParameter):
@@ -1739,6 +1953,9 @@ class VesselGraphPerformanceParams(UiParameter):
         }
 
 
+GRAPH_FILTER_SCALAR_TYPES = (bool, int, float, str)  # The python value types a filter can compare to
+
+
 class GraphFilterParams(UiParameter):  # FIXME: do we really pass the graph as argument or just the prop names/types ?
     def __init__(self, *, main_params, widget, graph, event_bus: EventBus, get_view=None, apply_patch=None):
         self.main_params = main_params
@@ -1747,34 +1964,58 @@ class GraphFilterParams(UiParameter):  # FIXME: do we really pass the graph as a
         self.layout = self.tab.parent().findChild(QVBoxLayout, 'filterParamsVerticalLayout')
 
         self.graph = graph
-        self.update_properties()
-        self.connect()
+        self.update_properties()  # connect() is called by UiParameter.__init__
+
+    def build_params_dict(self) -> dict:
+        return {}  # UI only: filters are not stored in the config, they name the density file
 
     def connect(self):
         self.tab.vertexFilterRadioButton.toggled.connect(self.update_properties)
         self.tab.graphFilterPropertyNameComboBox.currentTextChanged.connect(self.handle_property_name_changed)
 
-    def update_properties(self):
-        if self.filter_type == 'vertex':
-            properties = self.graph._base.vertex_properties
-        else:
-            properties = self.graph._base.edge_properties
-        properties_names = list(properties.keys())  # Guarantee order
-        dtypes = [properties[prop_name].python_value_type() for prop_name in properties_names]
-        dtype_names = []
-        for dtype in dtypes:
-            if isinstance(dtype, tuple):
-                dtype_names.append([t.__name__ for t in dtype][-1])  # if List[type] -> type
-            else:
-                dtype_names.append(dtype.__name__)
+    def _filterable_properties(self) -> dict[str, str]:
+        """
+        The properties that can be filtered on, for the selected filter type.
 
-        self.tab.graphFilterPropertyNameComboBox.clear()
-        for prop_name, dtype in zip(properties_names + ['degrees'], dtype_names + ['int']):
-            self.tab.graphFilterPropertyNameComboBox.addItem(prop_name, userData=dtype)
+        Vector valued properties (e.g. coordinates) and other non scalar ones are left out:
+        a filter compares one value (or a range) per vertex/edge.
+        ``degrees`` is only available for vertices.
+
+        Returns
+        -------
+        dict[str, str]
+            The type name ('bool', 'int', 'float' or 'str') of each property name, in graph order.
+        """
+        properties = self.graph._base.vertex_properties if self.filter_type == 'vertex' else self.graph._base.edge_properties
+        dtype_names = {}
+        for prop_name in properties.keys():
+            dtype = properties[prop_name].python_value_type()
+            if dtype in GRAPH_FILTER_SCALAR_TYPES:
+                dtype_names[prop_name] = dtype.__name__
+        if self.filter_type == 'vertex':
+            dtype_names['degrees'] = 'int'
+        return dtype_names
+
+    def update_properties(self, _=None):
+        """
+        Fill the property combo box with the filterable properties of the selected filter type
+        (vertex or edge), then reset the value widget to match the first one.
+
+        Parameters
+        ----------
+        _ : bool, optional
+            The checked state passed by ``toggled(bool)``. Intentionally discarded: the filter type
+            is read from the radio button. Not passed when called directly.
+        """
+        combo_box = self.tab.graphFilterPropertyNameComboBox
+        with QSignalBlocker(combo_box):  # one handler call at the end, not one per item (and none on an empty box)
+            combo_box.clear()
+            for prop_name, dtype_name in self._filterable_properties().items():
+                combo_box.addItem(prop_name, userData=dtype_name)
 
         self.handle_property_name_changed()  # Set default value for the first property
 
-        self.main_params.filtersChanged.emit()  # Notify that properties changed
+        self.main_params.notify_filters_changed()  # Notify that properties changed
 
     @property
     def cfg_subtree(self):
@@ -1831,15 +2072,18 @@ class GraphFilterParams(UiParameter):  # FIXME: do we really pass the graph as a
             return None
         return 'and' if and_button.isChecked() else 'or'
 
-    def suffix(self):
-        suffix = f'{self.property_name}_{self.get_property_value()}'
-        combine_action = self.combine_operator_name
-        if combine_action is not None:
-            suffix += f'_{combine_action}'
-        return suffix
-
     @param_handler  # FIXME: check
-    def handle_property_name_changed(self):
+    def handle_property_name_changed(self, _=None):
+        """
+        Replace the value widget by one suited to the type of the selected property
+        (check box, range of numbers or text) holding the default value of this type.
+
+        Parameters
+        ----------
+        _ : str, optional
+            The property name passed by ``currentTextChanged(str)``. Intentionally discarded:
+            the property and its type are read from the combo box. Not passed when called directly.
+        """
         property_dtype = self.current_dtype
         value = self.get_default_property_value()
         controls_layout = self.tab.filterControlsGridLayout
@@ -1862,7 +2106,7 @@ class GraphFilterParams(UiParameter):  # FIXME: do we really pass the graph as a
         self.tab.graphFilterPropertyValueWidget = replace_widget(
             self.tab.graphFilterPropertyValueWidget, widget, layout=controls_layout)
 
-        self.main_params.filtersChanged.emit()
+        self.main_params.notify_filters_changed()
 
     def __create_range_ctrl(self, widget_class, signed=True):
         """
@@ -1913,7 +2157,7 @@ class VesselVisualizationParams(UiParameter, OrthoviewerSlicingMixin):
     plot_type: str
     voxelization_size: List[int]
     vertex_degrees: str
-    weight_by_radius: bool
+    weight: str | None  # A GraphWeight name, None: unweighted
 
     pipeline = 'TubeMap'
 
@@ -1931,8 +2175,21 @@ class VesselVisualizationParams(UiParameter, OrthoviewerSlicingMixin):
             'graph_step': ParamLink(None, self.tab.graphSlicerStepComboBox, connect=False),
             'plot_type': ParamLink(None, self.tab.graphPlotTypeComboBox, connect=False),
             'voxelization_size': ParamLink(['voxelization', 'size'], self.tab.vasculatureVoxelizationRadiusTriplet),
-            'weight_by_radius': ParamLink(None, self.tab.voxelizationWeightByRadiusCheckBox, connect=False)
+            'weight': ParamLink(None, self.tab.voxelizationWeightComboBox, connect=False)
         }
+
+    def graph_weight(self, graph) -> GraphWeight | None:
+        """The weight chosen in the UI, applied to graph (None is enough to name it)"""
+        return None if self.weight is None else GraphWeight.from_name(graph, self.weight)
+
+    def set_weight_choices(self, weight_names: list[str]) -> None:
+        """Offer these weights (see graph_weights.weight_choices), keeping the current choice if still offered"""
+        combo = self.tab.voxelizationWeightComboBox
+        current = combo.currentText()
+        combo.clear()
+        combo.addItems(['None', *weight_names])
+        if combo.findText(current) != -1:
+            combo.setCurrentText(current)
 
     def set_structure_id(self, structure_widget):
         self.structure_id = int(structure_widget.text(1))
@@ -2068,7 +2325,6 @@ class GroupAnalysisParams(BatchParameters):
     """
     Essentially batch parameters with comparisons
     """
-    # plot_channel: str
     compute_sd_and_effect_size: bool
     density_suffix: str
     pipeline: str
@@ -2086,15 +2342,21 @@ class GroupAnalysisParams(BatchParameters):
 
         self._cmp_model = ComparisonsModel(sep=self.group_concatenator)
         self._cmp_ui = ComparisonsWidgetAdapter(self.tab.comparisonsVerticalLayout,
-                                                groups_sep=self.group_concatenator)
+                                                groups_sep=self.group_concatenator,
+                                                suffix_widget=self.tab.densitySuffixContainerWidget,
+                                                suffix_combo=self.tab.densitySuffixComboBox)
 
         # FIXME: do I want this ?
-        self._channels_provider: Optional[Callable[[], list[str]]] = None
+        self._channels_provider: Optional[Callable[[Optional[str]], list[str | tuple[str, ...]]]] = None
         self._suffixes_provider: Optional[Callable[[], list[str]]] = None
 
         self._on_plot_group: Optional[Callable[[str], None]] = None
 
-        self.plot_channel = ''
+        self._channels: dict[str, str | tuple[str, ...]] = {}  # What the user picks from (label) -> the channel
+        self._channel_label = ''
+        # The channels are those which have a density map for the suffix
+        self.tab.densitySuffixComboBox.currentIndexChanged.connect(self.refresh_channels)
+        self.tab.densitySuffixComboBox.lineEdit().editingFinished.connect(self.refresh_channels)
 
         # FIXME: do I remove this ?
         self.subscribe(UiBatchGroupsChanged, self._rebuild_comparisons)
@@ -2121,8 +2383,26 @@ class GroupAnalysisParams(BatchParameters):
         return comps
 
     # injection points from the tab
-    def set_channels_provider(self, provider: Callable[[], list[str]]):
+    def set_channels_provider(self, provider: Callable[[Optional[str]], list[str | tuple[str, ...]]]):
+        """provider(density_suffix): the channels to analyse, those which have a density map for the suffix"""
         self._channels_provider = provider
+
+    @property
+    def channel(self) -> str | tuple[str, ...] | None:
+        """
+        The channel picked in the tab, as the density maps, statistics and plots name it
+        (a tuple for a compound channel, e.g. the vessels), or None if there is none to analyse.
+        """
+        return self._channels.get(self._channel_label)
+
+    def refresh_channels(self, *_) -> None:
+        """Offer the channels which have a density map for the current suffix, keeping the pick if possible"""
+        suffix = self.density_suffix or None
+        channels = self._channels_provider(suffix) if callable(self._channels_provider) else []
+        self._channels = {channel_file_name_token(channel): channel for channel in channels}
+        if self._channel_label not in self._channels:
+            self._channel_label = next(iter(self._channels), '')
+        self._cmp_ui.set_channels(list(self._channels), current=self._channel_label)
 
     def set_suffixes_provider(self, provider: Callable[[], list[str]]):
         self._suffixes_provider = provider
@@ -2137,20 +2417,17 @@ class GroupAnalysisParams(BatchParameters):
         self._cmp_model.group_names = list(self.group_names)
         self._cmp_model.selected = preselected or []
 
-        channels = self._channels_provider() if callable(self._channels_provider) else []
         suffixes = self._suffixes_provider() if callable(self._suffixes_provider) else []
 
-        def _on_channel_changed(ch: str):
-            self.plot_channel = ch
+        def _on_channel_changed(label: str):
+            self._channel_label = label
 
         self._cmp_ui.rebuild(self._cmp_model,
                              on_plot_group=(self._on_plot_group or (lambda _g: None)),
-                             channels=channels, on_channel_changed=_on_channel_changed,
+                             on_channel_changed=_on_channel_changed,
                              suffixes=suffixes,
                              preselected_comparisons=self._cmp_model.selected)
-
-        if channels and not self.plot_channel:
-            self.plot_channel = channels[0]
+        self.refresh_channels()  # After the suffixes: the channels depend on the one selected
     @property
     def comparisons(self) -> list[Pair]:
         return self._cmp_model.all_pairs()

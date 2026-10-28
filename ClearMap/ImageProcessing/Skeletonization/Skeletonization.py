@@ -29,13 +29,14 @@ __download__  = 'http://www.github.com/ChristophKirst/ClearMap2'
 
 import numpy as np
 
-import ClearMap.IO.IO as io
+from ClearMap.IO import FileUtils as file_utils
 
 import ClearMap.ParallelProcessing.DataProcessing.ArrayProcessing as ap
 
 import ClearMap.ImageProcessing.Skeletonization.PK12 as PK12
 
 import ClearMap.Utils.Timer as tmr
+from ClearMap.IO import source_initialization, io_ops
 from ClearMap.Utils.utilities import sanitize_n_processes
 
 
@@ -72,7 +73,7 @@ def skeletonize(source, sink = None, points = None,
   if verbose:
     timer = tmr.Timer()
   
-  if not in_place and io.is_file(source):
+  if not in_place and file_utils.is_file(source):
     binary_buffer = ap.read(source).as_buffer()  # prange
   else:
     binary, binary_buffer = ap.initialize_source(source)
@@ -92,11 +93,11 @@ def skeletonize(source, sink = None, points = None,
     timer.print_elapsed_time(head='Skeletonization')
 
   if sink is None:
-    sink = io.initialize(result)
+    sink = source_initialization.initialize(result)
   elif isinstance(sink, str):
     sink = ap.write(sink, result)  # prange
   else:
-    sink = io.write(sink, result)
+    sink = io_ops.write(sink, result)
   return sink
 
 ###############################################################################
@@ -104,16 +105,14 @@ def skeletonize(source, sink = None, points = None,
 ###############################################################################
   
 def _test():
-  import numpy as np;
-  import ClearMap.IO.IO as io
-  import ClearMap.ImageProcessing.Skeletonization.Skeletonization as skl;
+  import ClearMap.ImageProcessing.Skeletonization.Skeletonization as skl
   import ClearMap.Visualization.Plot3d as p3d
   import ClearMap.Tests.Files as tsf
   
   from importlib import reload
   reload(skl)
   
-  binary = tsf.skeleton_binary;
+  binary = tsf.skeleton_binary
   
   #default version
   skeleton = skl.skeletonize(binary, delete_border=True, verbose=True);

@@ -17,8 +17,8 @@ from typing import List
 
 import numpy as np
 
-import ClearMap.IO.IO as io
-import ClearMap.IO.Slice as slc
+import ClearMap.IO.source.Slice as slc
+from ClearMap.IO import dispatch, io_ops
 
 
 ###############################################################################
@@ -61,17 +61,6 @@ class Block(slc.Slice):
         self._iteration = iteration
         self._blocks_shape = blocks_shape
         self._neighbours = neighbours
-
-    @property
-    def name(self):
-        """The name of this source.
-
-        Returns
-        -------
-        name : str
-            Name of this source.
-        """
-        return 'Block-' + self.source.name
 
     @property
     def valid(self):
@@ -168,7 +157,7 @@ class Block(slc.Slice):
        return Block(source=self.source.as_real(), slicing=self.slicing, valid_slicing=self.valid.slicing)
 
     def as_memory_block(self):
-        source = io.as_source(self.as_memory())
+        source = dispatch.as_source(self.as_memory())
         return Block(source=source, slicing=slice(None), valid_slicing=self.valid.slicing,
                      index=self.index, neighbours=self.neighbours)
 
@@ -274,8 +263,7 @@ def _test():
     import numpy as np   #analysis:ok
     import ClearMap.ParallelProcessing.Block as blk
 
-    import ClearMap.IO.IO as io
-    source = io.open_ro(np.asarray(np.random.rand(50,100,200), order='F'))
+    source = io_ops.open_ro(np.asarray(np.random.rand(50, 100, 200), order='F'))
 
     block = blk.Block(source=source, index=(1,2,3), blocks_shape=(10,20,30))
 

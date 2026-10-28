@@ -42,13 +42,16 @@ Design Notes
 from collections import defaultdict
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Tuple, Any, Union
+from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple, Any, Union
 
+from ClearMap.IO.channel_file_renaming import ChannelRenamePlan, plan_channel_file_renames
 from ClearMap.Utils.event_bus import EventBus, BusSubscriberMixin
-from ClearMap.Utils.events import WorkspaceChanged, UiChannelRenamed, UiChannelsChanged
+from ClearMap.Utils.events import WorkspaceChanged, UiChannelRenamed, UiChannelsChanged, CfgChanged
 from ClearMap.config.config_adjusters.type_hints import AdjusterScope
 from ClearMap.config.config_coordinator import ConfigCoordinator
+from ClearMap.config.config_handler import ConfigHandler
 from ClearMap.config.defaults_provider import DefaultsProvider
+from ClearMap.config.registration_channels import registration_pairs
 from ClearMap.pipeline_orchestrators.group_orchestrators import DensityGroupAnalysisOrchestrator
 from ClearMap.pipeline_orchestrators.processor_launcher import ProcessorLauncher
 
@@ -191,6 +194,9 @@ class ExperimentController(BusSubscriberMixin):
 
         self.subscribe(UiChannelRenamed, self.on_channel_renamed)
         self.subscribe(UiChannelsChanged, self.on_channels_changed)
+        # Independent of the subscription order: required sections are derived from the config alone.
+        #   the GUI re-checks its tabs on the CfgChanged emitted by sync_required_sections()
+        self.subscribe(CfgChanged, self.on_cfg_changed)
         # FIXME: also subscribe to dtype changed in config -> reconcile workers (pipelines)
 
     @property
@@ -358,8 +364,7 @@ class ExperimentController(BusSubscriberMixin):
             self.cfg_coordinator.seed_missing_from_defaults(tabs_only=True)
 
             # Normalize once (may add derived sections), then persist atomically
-            self.cfg_coordinator.submit(sample_manager=self.sample_manager, do_run_adjusters=True,
-                                        validate=True, commit=True)
+            self.cfg_coordinator.submit(sample_manager=self.sample_manager)
         finally:
             self._hydrating = False
 
@@ -529,6 +534,45 @@ class ExperimentController(BusSubscriberMixin):
         self._refresh_relevant_sections()
         self.reconcile_workers_after_channel_change(before=evt.before, after=evt.after)
 
+    def on_cfg_changed(self, evt: CfgChanged) -> None:
+        """
+        Sample edits (path, data_type, ...) can change which pipeline sections are required
+        (e.g. a tiled path makes 'stitching' required). Keep the active sections in sync.
+        """
+        if self._hydrating or self._exp_dir is None:
+            return
+        if not any(k == 'sample' or k.startswith('sample.channels') for k in evt.changed_keys):
+            return
+        self.sync_required_sections()
+
+    def sync_required_sections(self) -> bool:
+        """
+        Make the active config sections match the sections the sample currently requires.
+
+        Newly required sections are loaded from the experiment folder first (keeping any
+        previous user edits), then missing values are seeded from defaults, then the adjusters
+        run to populate their instance containers (e.g. stitching.channels).
+        Sections no longer required are dropped from the working config (their file is kept).
+
+        Returns
+        -------
+        bool
+            True if the active sections changed.
+        """
+        coord = self.cfg_coordinator
+        if not self.sample_manager.config:
+            return False
+        required = {ConfigHandler.normalise_cfg_name(s) for s in self.sample_manager.compute_required_sections()}
+        current = coord.active_sections
+        if required == current:  # Also the re-entrancy guard: the submit below emits CfgChanged
+            return False
+        coord.set_active_sections(required)
+        for name in required - current:
+            coord.load(name)
+        coord.seed_missing_from_defaults(tabs_only=True)
+        coord.submit(sample_manager=self.sample_manager)
+        return True
+
     def channel_snapshot(self):
         """
         Single “truth” event: current channel list + registration partner defaults,
@@ -560,9 +604,20 @@ class ExperimentController(BusSubscriberMixin):
         if not patch:
             return
         # print(f'Applying UI patch keys: {list(patch.keys())}')
-        self.cfg_coordinator.submit_patch(patch, sample_manager=self.sample_manager,
-                                          do_run_adjusters=True, validate=True, commit=True)
+        self.cfg_coordinator.submit_patch(patch, sample_manager=self.sample_manager)
         # self.evt_bus.publish(ConfigChanged({"rev": self.cfg_coordinator._rev}))
+
+    def plan_channel_file_renames(self, channel_renames: Mapping[str, str]) -> ChannelRenamePlan:
+        """
+        The files to rename with the channels (see :func:`plan_channel_file_renames`). Call it before the
+        rename is committed: the files, the workspace and the registration config still use the old names.
+        Empty if the workspace is not ready (no file can be named after the channels yet).
+        """
+        if not self.sample_manager.workspace_ready:
+            return ChannelRenamePlan()
+        registration_config = self.get_config_view().get('registration') or {'channels': {}}
+        return plan_channel_file_renames(self.sample_manager.workspace, channel_renames,
+                                         registration_pairs(registration_config))
 
     # ---- run path (snapshot + launch) ---------------------------------------
     def seal_and_snapshot(self) -> Path:
@@ -570,8 +625,7 @@ class ExperimentController(BusSubscriberMixin):
         Ensure the on-disk config is fully materialized & valid; take an immutable snapshot
         directory used by pipeline_orchestrators for reproducibility.
         """
-        self.cfg_coordinator.submit(sample_manager=self.sample_manager, do_run_adjusters=True,
-                                    validate=True, commit=True)
+        self.cfg_coordinator.submit(sample_manager=self.sample_manager)
         if not self.use_snapshots:
             if self._exp_dir is None:
                 raise ValueError('Workspace not set')
@@ -606,6 +660,9 @@ class ExperimentController(BusSubscriberMixin):
 
 
 ####################### Multi experiment controller ###########################
+DEFAULT_GROUP_PIPELINE = 'CellMap'
+
+
 class AnalysisGroupController:
     """
     Manages multiple ExperimentControllers, one per experiment root (src_dir).
@@ -716,16 +773,15 @@ class AnalysisGroupController:
     def _infer_pipeline(self) -> str:
         """
         Read pipeline from group config.
-        Falls back to 'CellMap' if not set.
+        Falls back to DEFAULT_GROUP_PIPELINE if not set (the first one the tab offers).
         """
         try:
             cfg = self.get_config_view()
             pipeline = (cfg.get('group_analysis', {}).get('pipeline')
                         or cfg.get('batch_processing', {}).get('pipeline'))
-            if pipeline:
-                return pipeline
         except Exception:
-            return 'CellMap'  # fallback
+            pipeline = None
+        return pipeline or DEFAULT_GROUP_PIPELINE
 
     def get_config_view(self) -> dict[str, Any]:
         return self.group_cfg_coordinator.get_config_view()
@@ -734,5 +790,4 @@ class AnalysisGroupController:
         if not patch:
             return
         self.group_cfg_coordinator.submit_patch(
-            patch, sample_manager=None,  # group scope: no SampleManager
-            do_run_adjusters=True, validate=True, commit=True)
+            patch, sample_manager=None)  # group scope: no SampleManager

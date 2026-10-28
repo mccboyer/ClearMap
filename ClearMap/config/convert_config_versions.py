@@ -10,23 +10,26 @@ from typing import Callable, Dict, Tuple
 
 import numpy as np
 from packaging.version import Version
-from importlib_metadata import version as importlib_version
 
 import qdarkstyle
 from PyQt5.QtWidgets import QApplication, QDialog
 
+from ClearMap import __version__
 from ClearMap.IO.assets_constants import CHANNELS_ASSETS_TYPES_CONFIG
+from ClearMap.IO.FileUtils import Rename, apply_renames
 from ClearMap.Utils.tag_expression import Expression
-from ClearMap.Utils.utilities import (try_get_item_recursive, set_item_recursive, has_item_recursive, deep_merge,
-                                      del_item_recursive)
+from ClearMap.config.config_adjusters.dict_ops import (try_get_item_recursive, set_item_recursive, has_item_recursive,
+                                                       del_item_recursive)
+from ClearMap.config.config_adjusters.patch_ops import deep_merge
 from ClearMap.config.config_handler import ConfigHandler, ALTERNATIVES_REG
+from ClearMap.config.registration_channels import MOVING_OTHER
 
 from ClearMap.gui.dialogs import RenameChannelsDialog, VerifyRenamingDialog
 from ClearMap.gui.dialog_helpers import get_directory_dlg
 from ClearMap.gui.gui_utils_base import ensure_qapp
 
 
-clearmap_version = importlib_version('ClearMap')
+clearmap_version = __version__
 VERSION_SUFFIX = f'v{Version(clearmap_version).major}_{Version(clearmap_version).minor}'
 
 
@@ -284,7 +287,7 @@ def _alignment_to_registration_v3(output_path_base, config_v1, sample_config):
             'resample': resample,
             'resampled_resolution': config_v1['registration']['resampling']['autofluo_sink_resolution'],
             'align_with': 'atlas',
-            'moving_channel': 'atlas',
+            'moving_channel': MOVING_OTHER,  # The atlas moves onto the reference channel
             'params_files': autofluo_params_files,
             'landmarks_weights': [0] * len(autofluo_params_files),
         }
@@ -296,7 +299,7 @@ def _alignment_to_registration_v3(output_path_base, config_v1, sample_config):
                 'resample': resample,
                 'resampled_resolution': config_v1['registration']['resampling']['raw_sink_resolution'],
                 'align_with': reference_channel,
-                'moving_channel': reference_channel,
+                'moving_channel': MOVING_OTHER,  # The reference channel moves onto the channel
                 'params_files': [config_v1['registration']['atlas']['align_channels_affine_file']],
                 'landmarks_weights': [0],
             }
@@ -508,22 +511,22 @@ class ExperimentUpgrade_2_1_to_3_0(ExperimentConfigConverter):
         files_to_rename = self._compute_new_file_names(files_to_rename)
         files_to_rename = self._compute_elastix_folders_new_names(files_to_rename, folders_to_rename)
 
-        # Verify renaming
-        files_to_rename = self.verify_renaming(files_to_rename)
+        renames = self.verify_renaming([Rename(main_folder / old_name, main_folder / new_name)
+                                        for old_name, new_name in files_to_rename.items()])
         if self._aborted:
             return
         else:
-            # Apply renaming
-            for old_name, new_name in files_to_rename:
-                (main_folder / old_name).rename(main_folder / new_name)
+            # Refused as a whole if it would overwrite a file, put back if it fails
+            apply_renames(renames)
 
-    def verify_renaming(self, files_to_rename: dict[str, str] = None):
-        dialog = VerifyRenamingDialog(files_to_rename)
+    def verify_renaming(self, renames: list[Rename]) -> list[Rename]:
+        dialog = VerifyRenamingDialog(renames, title='Verify renaming',
+                                      message='The files of the sample are renamed to the names of ClearMap 3. '
+                                              'Untick a file to leave it as it is.')
         if dialog.exec() == QDialog.Accepted:
-            files_to_rename = dialog.get_selected_files()
-        else:
-            self._aborted = True
-        return files_to_rename
+            return dialog.selected_renames
+        self._aborted = True
+        return []
 
     def _compute_elastix_folders_new_names(self, files_to_rename: dict[str, str], folders_to_rename: list[str]):
         """Handle the elastix folders renaming using channel info"""

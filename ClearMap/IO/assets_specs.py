@@ -19,9 +19,30 @@ import multiprocessing
 import warnings
 
 from ClearMap.IO.assets_constants import (EXTENSIONS, COMPRESSION_ALGORITHMS, CHECKSUM_ALGORITHMS,
-                                          RESOURCE_TYPE_TO_FOLDER, DATA_CONTENT_TYPES)
+                                          RESOURCE_TYPE_TO_FOLDER, DATA_CONTENT_TYPES, FILE_NAME_TOKEN_RE)
+from ClearMap.Utils.exceptions import ClearMapValueError
+from ClearMap.config.compound_keys import is_compound_channel, compound_channel_parts
 from ClearMap.Utils.tag_expression import Expression
 from ClearMap.Utils.utilities import validate_arg
+
+
+WEIGHTED_SUB_TYPE_INFIX = 'weighted'  # <sub_type>_weighted_<weights name>, see weighted_sub_type
+
+
+def weighted_sub_type(sub_type: str, weights_name: str) -> str:
+    """
+    The (dynamic) sub-type of a weighted variant of sub_type,
+    e.g. ``counts_weighted_size`` or ``branches_weighted_vertex_radius_units``
+
+    Raises
+    ------
+    ClearMapValueError
+        If weights_name cannot be used in a file name.
+    """
+    if not FILE_NAME_TOKEN_RE.fullmatch(weights_name):
+        raise ClearMapValueError(f'Weights {weights_name!r} cannot be used in a file name '
+                                 f'(allowed characters: {FILE_NAME_TOKEN_RE.pattern}).')
+    return f'{sub_type}_{WEIGHTED_SUB_TYPE_INFIX}_{weights_name}'
 
 
 class TypeSpec:
@@ -84,7 +105,8 @@ class TypeSpec:
             sub_types = {k: None for k in sub_types}
         else:
             sub_types = sub_types or {}
-        self.sub_types = sub_types
+        # None and dict entries become SubTypeSpecs in get_sub_type
+        self.sub_types: dict[str, TypeSpec | dict | None] = sub_types
         self.sub_folder = sub_folder
 
         self._file_format_category = file_format_category
@@ -316,20 +338,14 @@ class ChannelSpec:
             channel = tuple(channel)
             warnings.warn('Passing a list as channel is deprecated and will be removed in a future version.'
                           ' Use a tuple instead.', DeprecationWarning, stacklevel=2)
-        is_tuple = isinstance(channel, tuple)
-
-        # Enforce consistency between structure and content_type
-        if not is_tuple and content_type == 'compound':
-            if '-' in channel:
-                channel = tuple(channel.split('-'))
-            else:
-                raise ValueError(
-                    f"content_type='compound' requires a compound ChannelId (tuple), "
-                    f"got atomic {channel!r}"
-                )
-
-        if isinstance(channel, str) and '-' in channel:
-            channel = tuple(channel.split('-'))
+        parts = compound_channel_parts(channel)  # None for a simple channel; validates the names
+        if parts is not None:
+            channel = parts  # A compound channel is always identified by its tuple, never by 'a-b'
+        elif content_type == 'compound':  # Enforce consistency between structure and content_type
+            raise ValueError(
+                f"content_type='compound' requires a compound ChannelId (tuple), "
+                f"got atomic {channel!r}"
+            )
 
         if channel not in ChannelSpec.channel_names:
             ChannelSpec.channel_names.append(channel)
@@ -348,7 +364,7 @@ class ChannelSpec:
         return self.content_type not in (None, 'undefined', 'no-pipeline', 'compound')
 
     def is_compound(self):
-        return isinstance(self.name, tuple)
+        return is_compound_channel(self.name)
 
     def to_dict(self):
         return {

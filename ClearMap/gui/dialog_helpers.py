@@ -114,7 +114,7 @@ def make_nested_progress_dialog(title='Processing', overall_maximum=100, sub_pro
     progress_icon_path = os.path.join(UI_FOLDER, 'creator', 'graphics_resources', 'searching_mouse.png')
     dlg.progressImageLabel.setPixmap(QPixmap(progress_icon_path))  # TODO: why doesn't work with qrc ??
     dlg.setWindowTitle('Clearmap progress')
-    dlg.mainLabel.setText(f'{title}, please wait.')
+    dlg.mainLabel.setText(f'{title},\n please wait.')
 
     dlg.mainProgressBar.setRange(1, overall_maximum)
     dlg.subProgressLabel.setText(sub_process_name)
@@ -148,8 +148,8 @@ def make_splash(img_source=None, bar_max=100, message=None, res='hd', font_size=
 
     if message is None:
         from packaging.version import Version
-        from importlib_metadata import version
-        clearmap_version = Version(version('ClearMap'))
+        from ClearMap import __version__
+        clearmap_version = Version(__version__)
         message = f"ClearMap {clearmap_version.major}.{clearmap_version.minor}"
 
     # Calculate horizontal centering for the text.

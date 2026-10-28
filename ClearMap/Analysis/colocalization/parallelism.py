@@ -7,13 +7,13 @@ import numpy as np
 import pandas as pd
 from sklearn import neighbors
 
-from ClearMap.IO import IO as io
+from ClearMap.IO import io_ops
 
 import ClearMap.ParallelProcessing.BlockProcessing as blockprocessing
 import ClearMap.ParallelProcessing.Block as block
 from ClearMap.ParallelProcessing import ParallelTraceback as ptb
 
-from . import channel
+from . import colocalization_channel_mask_components
 
 
 def compare(
@@ -69,8 +69,8 @@ def compare(
 
     scale = np.array(scale)
     voxel_blob_diameters = np.array(blob_diameter) / scale
-    source_0 = io.open_ro(img_0)
-    source_1 = io.open_ro(img_1)
+    source_0 = io_ops.open_ro(img_0)
+    source_1 = io_ops.open_ro(img_1)
     if not isinstance(df_0, pd.DataFrame):
         df_0 = pd.read_feather(df_0)
     if not isinstance(df_1, pd.DataFrame):
@@ -223,11 +223,11 @@ def local_report_body(df_0, df_1, block_0, block_1, coord_names, scale, verbose,
 
     sub_df_0 = df_0.iloc[valid_indices_0].reset_index()
     sub_df_1 = df_1.iloc[contained_indices_1].reset_index()
-    channel_0 = channel.Channel(
+    channel_0 = colocalization_channel_mask_components.ColocalizationChannelMaskComponents(
         block_0.array, sub_df_0[coord_names] - start_array, voxel_dims=scale,
         coord_names=coord_names, clean_image=True, already_clean=are_already_clean[0]
     )
-    channel_1 = channel.Channel(
+    channel_1 = colocalization_channel_mask_components.ColocalizationChannelMaskComponents(
         block_1.array, sub_df_1[coord_names] - start_array, voxel_dims=scale,
         coord_names=coord_names, clean_image=True, already_clean=are_already_clean[1]
     )
@@ -253,7 +253,7 @@ def local_report_body(df_0, df_1, block_0, block_1, coord_names, scale, verbose,
     c0_result = c0_result.join(blobwise_overlap_df, validate="1:1")
     # correct centers computation for channel_1
     sub_df_1 = df_1.iloc[valid_indices_1].reset_index()
-    channel_1 = channel.Channel(
+    channel_1 = colocalization_channel_mask_components.ColocalizationChannelMaskComponents(
         block_1.array, sub_df_1[coord_names] - start_array, voxel_dims=scale, coord_names=coord_names
     )
     if verbose:

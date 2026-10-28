@@ -24,6 +24,18 @@ class ChannelsChanged:
     after: List[str]
 
 @dataclass(frozen=True)
+class WorkspaceChannelsUpdated:
+    """
+    Fact: the workspace channels (name -> data_type) changed after a reconciliation with the sample config.
+    Published by SampleManager.update_workspace() once the workspace is saved,
+    only when the mapping actually differs from the last published one.
+    Orchestrators that derive state from the channel set (e.g. TubeMap steps) subscribe to this.
+    """
+    before: Dict[str, str]
+    after: Dict[str, str]
+
+
+@dataclass(frozen=True)
 class ChannelsSnapshot:
     names: List[str]
 
@@ -59,6 +71,10 @@ class UiRequestPlotMiniBrain:
 @dataclass(frozen=True)
 class UiRequestPlotAtlas:
     channel_index: int
+
+@dataclass(frozen=True)
+class UiRequestShowChannelOrientation:
+    channel_name: Optional[str]  # None: the channel page shown
 
 @dataclass(frozen=True)
 class UiRequestLandmarksDialog:
@@ -131,3 +147,40 @@ class UiBatchResultsFolderChanged:
 @dataclass(frozen=True)
 class UiBatchGroupsChanged:
     groups: Dict[str, List[str]]
+
+
+# The progress of the processing (published by ClearMap.Utils.progress.ProgressWatcher; the progress dialog of the
+# GUI and the log of a headless run subscribe). The main steps, then the substep inside the current main step.
+@dataclass(frozen=True)
+class ProgressMainStepNameChanged:
+    name: str
+
+
+@dataclass(frozen=True)
+class ProgressSubStepNameChanged:
+    name: Optional[str]
+
+
+@dataclass(frozen=True)
+class ProgressMainValueChanged:
+    value: int
+
+
+@dataclass(frozen=True)
+class ProgressMainMaximumChanged:
+    maximum: int
+
+
+@dataclass(frozen=True)
+class ProgressSubValueChanged:
+    value: int
+
+
+@dataclass(frozen=True)
+class ProgressSubMaximumChanged:
+    maximum: int
+
+
+@dataclass(frozen=True)
+class ProgressFinished:
+    main_step_name: str

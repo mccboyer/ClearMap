@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ClearMap.IO import IO as clearmap_io
+from ClearMap.IO import io_ops
 
 from ClearMap.Analysis.Statistics import MultipleComparisonCorrection as clearmap_FDR
 
@@ -173,7 +173,7 @@ def read_group(sources, combine=True, **args):
     # read the individual files
     group = []
     for f in sources:
-        data = clearmap_io.read(f)
+        data = io_ops.read(f)
         group.append(data[np.newaxis, ...])
     if combine:
         return np.vstack(group)
@@ -386,7 +386,7 @@ def sanitize_df(gp_names, grouped_counts, total_df):
 #
 #   # TODO: simple implementation -> slow -> speed up
 #   if not isinstance(shape, tuple):
-#     shape = io.shape(shape)
+#     shape = source_geometry.shape(shape)
 #   if len(shape) != 3:
 #       raise RuntimeError('Shape expected to be 3d, found %r' % (shape,))
 #

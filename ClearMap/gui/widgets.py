@@ -9,7 +9,6 @@ This module provides reusable Qt widgets and compound controls used
 throughout the ClearMap graphical interface, including:
 
 - :class:`OrthoViewer` — orthogonal slice viewer for 3-D images.
-- :class:`ProgressWatcher` — progress monitoring with log-file polling.
 - :class:`TwoListSelection` — dual-list item picker (available ↔ selected).
 - :class:`CheckableListWidget` — list with per-item checkboxes.
 - :class:`DataFrameWidget` — simple table display for pandas DataFrames.
@@ -43,7 +42,6 @@ from ast import literal_eval
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import permutations
-from multiprocessing import cpu_count
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import Optional, List, Tuple, Callable, Dict
@@ -68,16 +66,20 @@ from PyQt5.QtWidgets import (QWidget, QDialogButtonBox, QListWidget, QListWidget
 
 from ClearMap import Settings
 from ClearMap.IO.assets_constants import DATA_CONTENT_TYPES
-from ClearMap.IO.metadata import pattern_finders_from_base_dir, ChannelPatternSpec, PatternFinder
-from ClearMap.Utils.utilities import gpu_params, bytes_to_human, trim_or_pad
+from ClearMap.IO.tile_patterns import pattern_finders_from_base_dir, ChannelPatternSpec, PatternFinder
+from ClearMap.config.channel import ChannelId
+from ClearMap.config.compound_keys import compound_channel_parts
+from ClearMap.Utils.exceptions import ClearMapValueError
+from ClearMap.Utils.utilities import bytes_to_human, trim_or_pad, available_cpu_count, sanitize_n_processes
+from ClearMap.Utils.nvidia_utils import gpu_params
 from ClearMap.Visualization import Plot3d as plot_3d
 from ClearMap.Visualization.Qt.widgets import Scatter3D
 from ClearMap.config.atlas import STRUCTURE_TREE_NAMES_MAP
 from ClearMap.config.config_handler import scan_folder_for_experiments
 
 from ClearMap.gui import dialog_helpers as dlg_help
-from ClearMap.gui.gui_utils_base import create_clearmap_widget, compute_grid, get_widget, delete_widget, clear_layout, \
-    unique_connect
+from ClearMap.gui.gui_utils_base import (create_clearmap_widget, compute_grid, get_widget, delete_widget, clear_layout,
+                                         unique_connect)
 from ClearMap.gui.gui_utils_images import get_pseudo_random_color, is_dark
 
 USER_NAME = getpass.getuser()
@@ -253,325 +255,6 @@ class OrthoViewer:
             for btn in dv.axis_buttons:
                 btn.setEnabled(False)
         return dvs
-
-
-class ProgressWatcher(QWidget):  # Inspired from https://stackoverflow.com/a/66266068
-    """
-    A QWidget that watches the progress of a process.
-
-    It uses signals to update the progress bar and the text.
-    The main setup methods are :meth:`setup` and :meth:`prepare_for_substep`.
-    It is meant to be used in conjunction with a progress dialog to which it
-    is connected through its signals.
-    """
-    #: Emitted when the main step name changes. Argument: step name.
-    main_step_name_changed = QtCore.pyqtSignal(str)
-    #: Emitted when the sub-step name changes. Argument: step name.
-    sub_step_name_changed = QtCore.pyqtSignal(str)
-
-    #: Emitted when the main progress value changes. Argument: current value.
-    main_progress_changed = QtCore.pyqtSignal(int)
-    #: Emitted when the main progress maximum changes. Argument: new maximum.
-    main_max_changed = QtCore.pyqtSignal(int)
-
-    #: Emitted when the sub-step progress value changes. Argument: current value.
-    progress_changed = QtCore.pyqtSignal(int)
-    #: Emitted when the sub-step progress maximum changes. Argument: new maximum.
-    max_changed = QtCore.pyqtSignal(int)
-
-    #: Emitted when all processing has finished. Argument: main step name.
-    finished = QtCore.pyqtSignal(str)
-    #: Emitted when processing is aborted. Argument: whether abort was confirmed.
-    aborted = QtCore.pyqtSignal(bool)  # FIXME: use
-
-    def __init__(self, max_progress=100, main_max_progress=1, timer_interval_ms=250, parent=None):
-        """
-        Create a ProgressWatcher.
-
-        Parameters
-        ----------
-        max_progress : int
-            The maximum progress value; when the progress reaches this value,
-            the (sub-)operation is considered finished. Default is 100.
-        main_max_progress : int
-            The maximum progress value for the main operation.
-            When the progress reaches this value, the main operation
-            is considered finished. If all sub-operations are also finished, this is usually linked to the end of the
-            whole process.
-            Default is 1.
-        timer_interval_ms : int
-            Polling interval in milliseconds for log-based progress. Default is 250.
-        parent : QWidget
-            The parent widget.
-        """
-        super().__init__(parent)
-        self._main_step_name = 'Processing'
-        self._sub_step_name = None
-        self.__main_progress = 1
-        self.__main_max_progress = main_max_progress
-        self.__progress = 0
-        self.__max_progress = max_progress
-        self.range_fraction = 1  # FIXME: unused
-
-        self.n_dones = 0
-        self.previous_log_length = 0  # The log length at the end of the previous operation
-        self.log_path = None
-        self.pattern = None
-
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._on_tick)
-        self._interval_ms = timer_interval_ms
-
-    def __del__(self):
-        self.set_main_progress(self.main_max_progress)
-        self.set_progress(self.max_progress)
-        if self.parentWidget() is not None:
-            self.parentWidget().app.processEvents()
-
-    def reset(self):
-        """Reset all the values to their initial state."""
-        self.main_step_name = 'Processing'
-        self.__main_progress = 1
-        self.__main_max_progress = 1
-        self.__progress = 0
-        self.__max_progress = 100
-        self.range_fraction = 1  # FIXME: unused
-
-        self.n_dones = 0
-        self.previous_log_length = 0  # The log length at the end of the previous operation
-        self.log_path = None
-        self.pattern = None
-
-    def setup(self, main_step_name, main_step_length, sub_step_length=0, pattern=None):
-        """
-        Post-initialisation setup.
-
-        Parameters
-        ----------
-        main_step_name : str
-            Title of the main processing step.
-        main_step_length : int
-            Total number of main steps.
-        sub_step_length : int
-            Total number of sub-steps within the current main step.
-        pattern : str or re.Pattern or tuple or None
-            Text pattern to search for in logs to detect progress increments.
-        """
-        self.main_step_name = main_step_name
-        self.main_max_progress = main_step_length
-        # self.sub_step_name = sub_step_name
-        self.max_progress = sub_step_length
-        self.pattern = pattern
-
-        self.reset_log_length()
-        self.set_main_progress(1)
-        self.set_progress(0)
-        # Force update
-        self.main_progress_changed.emit(self.__main_progress)
-        self.progress_changed.emit(self.__progress)
-
-    def set_poll_interval(self, ms: int):
-        """Set the log-polling interval in milliseconds."""
-        self._interval_ms = ms
-        if self._timer.isActive():
-            self._timer.start(self._interval_ms)
-
-    def start_polling(self):
-        """Start polling the log file for progress pattern matches."""
-        if not self.log_path:  # If not setup
-            return
-        self.reset_log_length()
-        self._timer.start(self._interval_ms)
-
-    def stop_polling(self):
-        """Stop log-file polling."""
-        self._timer.stop()
-
-    def _on_tick(self):
-        if not self.pattern or not self.log_path:
-            return
-        dones = self.count_dones()
-        self.set_progress(dones)
-
-    def prepare_for_substep(self, step_length, pattern, step_name):
-        """
-        Setup the watcher for a new substep.
-
-        Parameters
-        ----------
-        step_length : int
-            The number of steps in the operation.
-        pattern : str or re.Pattern or tuple or None
-            The text to look for in the logs to check for progress.
-        step_name : str
-            Name (title) of the substep.
-        """
-        self.max_progress = step_length
-        self.pattern = pattern
-        self.reset_log_length()
-        self.set_progress(0)
-        self.sub_step_name = step_name
-
-    def get_progress(self):
-        """
-        Get the current progress.
-
-        Returns
-        -------
-        int
-        """
-        return self.__progress
-
-    def set_progress(self, value):
-        """
-        Set the progress value of the current main or sub step.
-
-        Parameters
-        ----------
-        value : int
-            The progress value.
-        """
-        if self.__progress == value:
-            return
-        self.__progress = round(value)
-        self.progress_changed.emit(self.__progress)
-
-    def set_main_progress(self, value):
-        """
-        Set the progress value for the main step.
-
-        Parameters
-        ----------
-        value : int
-            The progress value.
-        """
-        if self.__main_progress == value:
-            return
-        self.__main_progress = round(value)
-        self.reset_log_length()
-        self.main_progress_changed.emit(self.__main_progress)
-        if self.__main_progress != 0 and self.__main_progress == self.main_max_progress + 1:
-            self.finished.emit(self.main_step_name)
-
-    def increment_main_progress(self, increment=1):
-        """
-        Integer increment of the main progress.
-
-        Parameters
-        ----------
-        increment : int
-            The increment value (default is 1).
-        """
-        self.set_main_progress(self.__main_progress + round(increment))
-
-    def increment(self, increment):
-        """
-        Increment the progress value of the current main or sub step.
-
-        Parameters
-        ----------
-        increment : int or float
-            The increment value. If float, it is considered as a fraction
-            of the maximum progress value.
-        """
-        if isinstance(increment, float):
-            self.set_progress(self.__progress + int(self.max_progress * increment))
-        elif isinstance(increment, int):
-            self.set_progress(self.__progress + increment)
-
-    @property
-    def max_progress(self):
-        """Current sub-step maximum."""
-        return self.__max_progress
-
-    @max_progress.setter
-    def max_progress(self, value):
-        self.__max_progress = round(value)
-        self.max_changed.emit(self.__max_progress)
-
-    @property
-    def main_max_progress(self):
-        """Current main-step maximum."""
-        return self.__main_max_progress
-
-    @main_max_progress.setter
-    def main_max_progress(self, value):
-        self.__main_max_progress = round(value)
-        self.main_max_changed.emit(self.__main_max_progress)
-
-    @property
-    def main_step_name(self):
-        """Current main step name."""
-        return self._main_step_name
-
-    @main_step_name.setter
-    def main_step_name(self, step_name):
-        self._main_step_name = step_name
-        self.main_step_name_changed.emit(self.main_step_name)
-
-    @property
-    def sub_step_name(self):
-        """Current sub-step name."""
-        return self._sub_step_name
-
-    @sub_step_name.setter
-    def sub_step_name(self, step_name):
-        self._sub_step_name = step_name
-        self.sub_step_name_changed.emit(self.sub_step_name)
-
-    def __match(self, line):
-        if isinstance(self.pattern, tuple):  # TODO: cache
-            return self.pattern[0] in line and self.pattern[1].match(line)  # Most efficient
-        elif isinstance(self.pattern, str):
-            return self.pattern in line
-        elif isinstance(self.pattern, re.Pattern):
-            return self.pattern.match(line)
-
-    def count_dones(self):
-        """
-        Parse the logs to extract the number of completed operations
-        (based on ``self.pattern``). For each match, the progress is
-        incremented by 1. For efficiency, the logs are read from the
-        last read position.
-
-        Returns
-        -------
-        int
-            The cumulative number of matched operations.
-        """
-        if self.pattern is None:
-            return 0
-        try:
-            with open(self.log_path, 'rb') as log:      # binary: seek is byte-exact
-                log.seek(self.previous_log_length)
-                raw = log.read()
-                self.previous_log_length = log.tell()   # update to real end position
-        except (FileNotFoundError, OSError):
-            return self.n_dones
-
-        text = raw.decode('utf-8', errors='replace')    # 0x9C → \ufffd, no crash
-        new_lines = text.splitlines(keepends=True)
-
-        n_dones = len([ln for ln in new_lines if self.__match(ln)])
-        self.n_dones += n_dones
-        return self.n_dones
-
-    def reset_log_length(self):
-        """Reset the done counter and seek to the end of the log file."""
-        self.n_dones = 0
-        if not self.log_path:
-            self.previous_log_length = 0
-            return
-        try:
-            with open(self.log_path, 'rb') as log:
-                log.seek(0, 2)                          # SEEK_END
-                self.previous_log_length = log.tell()   # real byte offset
-        except FileNotFoundError:
-            self.previous_log_length = 0
-
-    def finish(self):
-        """Trigger the finished signal."""
-        self.finished.emit(self.main_step_name)
 
 
 # Adapted from https://stackoverflow.com/a/54917151 by https://stackoverflow.com/users/6622587/eyllanesc
@@ -912,7 +595,7 @@ class DataFrameWidget(QWidget):  # TODO: optional format attribute with shape of
         for i in range(len(self.df.index)):
             for j in range(self.df.columns.size):
                 v = self.df.iloc[i, j]
-                if self.df.dtypes[j] == np.float_:
+                if self.df.dtypes.iloc[j] == np.float_:
                     self.table.setItem(i, j, QTableWidgetItem(f'{v:.{self.n_digits}}'))
                 else:
                     self.table.setItem(i, j, QTableWidgetItem(f'{v}'))
@@ -1252,7 +935,7 @@ class ManageAssetsWidget(WizardWidget):
             params['check'] = dlg_help.prompt_dialog('Decompression',
                                                      'Do you want to verify the integrity of the files?')
         if action_name == 'convert':
-            params['processes'] = cpu_count() - 2
+            params['processes'] = sanitize_n_processes(-2)
             for asset in self.selected_assets:
                 if asset.type_spec.extensions:
                     extensions = asset.type_spec.extensions
@@ -1296,7 +979,7 @@ class ManageAssetsWidget(WizardWidget):
                 dv.resize(width, height)
                 dv.setMinimumSize(width, height)  # required to avoid wobbly dv
             dlg.graphLayout.addWidget(dv, row, col, 1, 1)
-        self.app.processEvents()
+        QApplication.processEvents()
 
     def assert_all_images(self):
         if not all([asset.is_existing_source for asset in self.selected_assets]):
@@ -1326,7 +1009,7 @@ class ManageAssetsWidget(WizardWidget):
 
     def resample_assets(self):
         resampling_params = {k: v for k, v in self.resampling_params.items() if v not in (1, None)}
-        self.sample_manager.resample_assets(self.selected_assets, processes=cpu_count() -2, **resampling_params)
+        self.sample_manager.resample_assets(self.selected_assets, processes=sanitize_n_processes(-2), **resampling_params)
 
 
 class PatternDialog(WizardWidget):
@@ -1531,7 +1214,7 @@ class PatternDialog(WizardWidget):
             while not result.ready():
                 result.wait(0.25)
                 dlg_help.update_pbar(self.app, progress_bar.mainProgressBar, 1)  # TODO: real update
-                self.app.processEvents()
+                QApplication.processEvents()
             pattern_finders = result.get()
         dlg_help.update_pbar(self.app, progress_bar.mainProgressBar, 100)
         return pattern_finders
@@ -1747,7 +1430,7 @@ class Landmark:
         -------
         bool
         """
-        return all([all(coords) for coords in self.coords.values()])
+        return not any(np.isnan(coords).any() for coords in self.coords.values())  # Unset: NaN (0 is a position)
 
     def activate(self):
         self.button.click()
@@ -2052,6 +1735,8 @@ class PerfMonitor(QWidget):
     cpu_vals_changed = QtCore.pyqtSignal(int, int, int)
     #: Emitted when GPU values update. Arguments: ``(gpu_percent, vram_percent)``.
     gpu_vals_changed = QtCore.pyqtSignal(int, int)
+    # Internal: a CPU sample taken in the sampler thread, delivered (queued) to the main thread
+    _cpu_sampled = QtCore.pyqtSignal(int, int, int)
 
     def __init__(self, parent, fast_period, slow_period, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
@@ -2078,6 +1763,11 @@ class PerfMonitor(QWidget):
         self.file_watcher = QtCore.QFileSystemWatcher([self.gpu_proc_file_path, self.cpu_proc_file_path])
         self.file_watcher.fileChanged.connect(self.handle_proc_changed)
         self.pool = ProcessPoolExecutor(max_workers=1)
+
+        # psutil.process_iter() takes ~0.2 s: sample in a background thread, never on the main thread
+        self._cpu_sampler = ThreadPoolExecutor(max_workers=1, thread_name_prefix='perf_monitor_cpu')
+        self._cpu_sample_pending = False
+        self._cpu_sampled.connect(self._apply_cpu_values, type=Qt.QueuedConnection)
 
     def start(self):
         self.fast_timer.start()
@@ -2110,14 +1800,34 @@ class PerfMonitor(QWidget):
     def get_ram_percent(self):
         return round(psutil.virtual_memory().percent)
 
-    def _get_cpu_vals(self):
-        with ThreadPoolExecutor(max_workers=1) as pool:  # TODO: check if should use self.pool instead
-            futures = [pool.submit(f) for f in (self.get_cpu_percent, self.get_thread_percent, self.get_ram_percent)]
-            percents = [f.result() for f in futures]
-        return percents
+    def _sample_cpu_values(self) -> tuple[int, int, int]:
+        """Runs in the sampler thread."""
+        return self.get_cpu_percent(), self.get_thread_percent(), self.get_ram_percent()
 
     def update_cpu_values(self):
-        percent_cpu, percent_thread, percent_ram = self._get_cpu_vals()
+        """
+        Timer slot (main thread): request a CPU sample and return immediately.
+        The values are applied by _apply_cpu_values when the sample is ready.
+        A tick is skipped while the previous sample is still running.
+        """
+        if self._cpu_sample_pending:
+            return
+        self._cpu_sample_pending = True
+        self._cpu_sampler.submit(self._sample_cpu_values).add_done_callback(self._on_cpu_sample_done)
+
+    def _on_cpu_sample_done(self, future):
+        """Runs in the sampler thread: hand the values over to the main thread."""
+        try:
+            values = future.result()
+        except Exception as err:  # A failed sample must not stop the monitor
+            print(f'CPU monitor: {err}')
+            self._cpu_sample_pending = False
+            return
+        self._cpu_sampled.emit(*values)
+
+    def _apply_cpu_values(self, percent_cpu: int, percent_thread: int, percent_ram: int):
+        """Main thread."""
+        self._cpu_sample_pending = False
         if percent_ram != self.percent_ram or percent_cpu != self.percent_cpu or percent_thread != self.percent_thread:
             self.percent_cpu = percent_cpu
             self.percent_thread = percent_thread
@@ -2151,6 +1861,77 @@ class PerfMonitor(QWidget):
                 self.gpu_vals_changed.emit(self.percent_gpu, self.percent_v_ram)
         except (ValueError, ZeroDivisionError) as err:
             print(f'GPU monitor: {err}')
+
+
+#: The Qt property of a channel page which holds the text of its ChannelPageId. Qt has no id for a tab: the page is it.
+CHANNEL_PAGE_ID_PROPERTY = 'channel_page_id'
+CHANNEL_PAGE_ID_SEP = ','  # Between the ids of the parts of a compound channel: not in the text of an id
+
+
+@dataclass(frozen=True)
+class ChannelPageId:
+    """
+    The identity of a channel page: which channel it shows. One page, one ChannelPageId.
+
+    For a channel of the sample it is the ChannelId of that channel. A compound channel (e.g. the colocalization
+    pair ``'fos-auto'``) has no id of its own in the registry: its page is identified by the ChannelIds of its parts,
+    in order (a pair can be oriented). The page is found by it, never by its tab text or index, which a rename or a
+    removal moves.
+    """
+    channel_ids: tuple[ChannelId, ...]  # The id of the channel, or the ids of the parts of the compound channel
+
+    def __post_init__(self):
+        if not self.channel_ids or not all(isinstance(channel_id, ChannelId) for channel_id in self.channel_ids):
+            raise ClearMapValueError(f'A channel page id is made of one ChannelId or more, got {self.channel_ids!r}')
+
+    @classmethod
+    def of_channel(cls, channel_name: str, registry) -> 'ChannelPageId | None':
+        """
+        The page id of the channel named channel_name (a channel of the sample or a compound channel), or None while
+        the registry does not know it (each part, for a compound channel).
+        """
+        names = compound_channel_parts(channel_name) or (channel_name,)
+        if not all(registry.has_name(name) for name in names):
+            return None
+        return cls(tuple(registry.resolve(name).id for name in names))
+
+    def is_known_by(self, registry) -> bool:
+        """Whether the channel of the page is still in registry (each part of it, for a compound channel)"""
+        return all(registry.has_id(channel_id) for channel_id in self.channel_ids)
+
+    @property
+    def text(self) -> str:
+        return CHANNEL_PAGE_ID_SEP.join(channel_id.value for channel_id in self.channel_ids)
+
+    @classmethod
+    def from_text(cls, text: str) -> 'ChannelPageId':
+        """Refused (InvalidChannelIdError) if text is not made of the texts of ChannelIds"""
+        return cls(tuple(ChannelId(part) for part in text.split(CHANNEL_PAGE_ID_SEP)))
+
+
+def set_channel_page_id(page, page_id: ChannelPageId) -> None:
+    """Remember the channel of a page on the page itself (the text of its ChannelPageId, as a Qt property)"""
+    page.setProperty(CHANNEL_PAGE_ID_PROPERTY, page_id.text)
+
+
+def assign_channel_page_id_if_known(page, channel_name: str, registry) -> None:
+    """
+    Give the page the id of its channel once the registry knows the channel (each part, for a compound channel).
+    A page can be made before that (e.g. a new channel tab, named before its config is committed): it then gets its
+    id at the first reconcile.
+    """
+    if channel_page_id_of(page) is None:
+        page_id = ChannelPageId.of_channel(channel_name, registry)
+        if page_id is not None:
+            set_channel_page_id(page, page_id)
+
+
+def channel_page_id_of(page) -> ChannelPageId | None:
+    """The ChannelPageId of a page, recreated from its property; None if the page was not given one"""
+    value = page.property(CHANNEL_PAGE_ID_PROPERTY)
+    if not value:  # Qt gives None (or an invalid QVariant) for a property which was never set
+        return None
+    return ChannelPageId.from_text(str(value))
 
 
 class ExtendableTabWidget(QTabWidget):
@@ -2203,6 +1984,23 @@ class ExtendableTabWidget(QTabWidget):
         if widget:
             self.removeTab(idx)
             widget.deleteLater()
+
+    def move_channel_widget(self, name, index):
+        """Move the page of channel ``name`` to position ``index`` (among the channel pages)"""
+        widget, current_idx = self.get_channel_widget(name, return_idx=True)
+        if widget is not None and current_idx != index:
+            self.tabBar().moveTab(current_idx, index)
+
+    def get_channel_widget_by_page_id(self, page_id: ChannelPageId, return_idx=False):
+        """The channel page with this id, found by the id it holds (not by its tab text)"""
+        for i in range(self.last_real_tab_idx):
+            if channel_page_id_of(self.widget(i)) == page_id:
+                if return_idx:
+                    return self.widget(i), i
+                return self.widget(i)
+        if return_idx:
+            return None, -1
+        return None
 
     def get_channel_widget(self, name=None, return_idx=False):
         if name is None:
@@ -2504,16 +2302,29 @@ class ComparisonsWidgetAdapter:
     Owns and (re)builds the comparisons area. Exposes only high-level ops
     so GroupAnalysisParams doesn't touch low-level widgetry.
     """
-    def __init__(self, layout, groups_sep: str = " vs "):
+    def __init__(self, layout, groups_sep: str = " vs ", *,
+                 suffix_widget: Optional[QWidget] = None, suffix_combo: Optional[QComboBox] = None):
+        """
+        Parameters
+        ----------
+        layout: QLayout
+            The layout (re)built, which also holds the density suffix widget.
+        suffix_widget: QWidget | None
+            The container of the density suffix combobox. It is kept across the rebuilds,
+            the layout is cleared otherwise (and so the widget deleted). Looked for by name if not given.
+        suffix_combo: QComboBox | None
+            The density suffix combobox, in suffix_widget. Looked for by name if not given.
+        """
         self._layout = layout
         self._sep = groups_sep
         self._checkboxes: List[QCheckBox] = []
         self._plot_btns: List[QPushButton] = []
         self._channel_combo: Optional[QComboBox] = None
-        self._suffix_widget: Optional[QWidget] = None  # ← preserve across rebuilds
+        self._suffix_widget: Optional[QWidget] = suffix_widget  # ← preserve across rebuilds
+        self._suffix_combo: Optional[QComboBox] = suffix_combo
 
     def rebuild(self, model: ComparisonsModel, *, on_plot_group: Callable[[str], None],
-                channels: List[str], on_channel_changed: Callable[[str], None],
+                on_channel_changed: Callable[[str], None],
                 suffixes: List[str] = None,
                 preselected_comparisons: Optional[List[Pair]] = None) -> None:
 
@@ -2552,8 +2363,10 @@ class ComparisonsWidgetAdapter:
             self._layout.addWidget(self._suffix_widget)
             # Update combobox
             if suffixes is not None:
-                combo = self._suffix_widget.findChild(QComboBox, 'densitySuffixComboBox')
-                if combo:
+                combo = self._suffix_combo
+                if combo is None:
+                    combo = self._suffix_widget.findChild(QComboBox, 'densitySuffixComboBox')
+                if combo is not None:  # Not "if combo": an empty QComboBox is falsy (len() is its count)
                     combo.blockSignals(True)
                     current = combo.currentText()
                     combo.clear()
@@ -2564,19 +2377,37 @@ class ComparisonsWidgetAdapter:
                         combo.setCurrentText(suffixes[0])
                     combo.blockSignals(False)
 
-        # Channel to plot combobox
-        if channels:
-            lyt = QHBoxLayout(parent=self._layout)
-            plot_channel_lbl = QLabel('Channel: ')
-            lyt.addWidget(plot_channel_lbl)
-            plot_channel_combobox = QComboBox()
-            plot_channel_combobox.addItems(channels)
-            plot_channel_combobox.currentTextChanged.connect(on_channel_changed)
-            lyt.addWidget(plot_channel_combobox)
-            self._layout.addLayout(lyt)
-            self._channel_combo = plot_channel_combobox
+        # Channel to analyse combobox (filled by set_channels, it depends on the suffix)
+        lyt = QHBoxLayout()
+        lyt.addWidget(QLabel('Channel: '))
+        channel_combobox = QComboBox()
+        channel_combobox.currentTextChanged.connect(on_channel_changed)
+        lyt.addWidget(channel_combobox)
+        self._layout.addLayout(lyt)
+        self._channel_combo = channel_combobox
 
         self._layout.addStretch()
+
+    def set_channels(self, labels: List[str], current: Optional[str] = None) -> None:
+        """
+        Fill the channels combobox, keeping the comparisons as they are.
+
+        Parameters
+        ----------
+        labels: list[str]
+            The channels to choose from
+        current: str | None
+            The one to select, the first if it is not one of labels.
+        """
+        combo = self._channel_combo
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(labels)
+        if current in labels:
+            combo.setCurrentText(current)
+        combo.blockSignals(False)
 
     def selected_pairs(self, model: ComparisonsModel) -> List[Pair]:
         out: List[Pair] = []
@@ -2722,6 +2553,10 @@ class GroupsWidgetAdapter(QWidget):
     def set_value(self, groups: Dict[str, List[str]]) -> None:
         if self._rebuilding:   # prevent re-entrant calls from cfg_to_ui
             return
+        if list(groups.items()) == list(self.get_value().items()):
+            # The config echoes what the pages already show (e.g. the group name just edited): rebuilding
+            # would destroy the page whose line edit is emitting editingFinished (crash on focus loss)
+            return
         self._rebuilding = True
         try:
             self._clear()
@@ -2854,17 +2689,19 @@ class GroupsWidgetAdapter(QWidget):
         idx = self._toolbox.currentIndex()
         if idx < 0:
             return -1
-        delete_widget(tool_box=self._toolbox, toolbox_page_index=idx)
-        self._pages.pop(idx)
-        # re-sync label change hooks if you rely on index in the lambda above
-        for i, p in enumerate(self._pages):
-            p.connect_group_name_changed(lambda txt, idx_=i: self._toolbox.setItemText(idx_, self.__gp_name(txt, idx_)))
+        self._discard_page(idx)
+        for i in range(len(self._pages)):  # The default names (Group_<n>) depend on the position
+            self._sync_label(i)
         return idx
 
     def _remove_page_at(self, idx: int) -> None:
         if 0 <= idx < len(self._pages):
-            delete_widget(tool_box=self._toolbox, toolbox_page_index=idx)
-            self._pages.pop(idx)
+            self._discard_page(idx)
+
+    def _discard_page(self, idx: int) -> None:
+        """Remove the page from the toolbox and delete its widget (deferred, see delete_widget)"""
+        page = self._pages.pop(idx)
+        delete_widget(widget=page.widget, tool_box=self._toolbox, toolbox_page_index=idx)
 
     def __gp_name(self, name, idx):
         return name or f"Group_{idx + 1}"
@@ -2898,7 +2735,7 @@ class NProcessesWidget(QWidget):
         self._spin = QSpinBox(self)
         self._spin.setMinimum(1)
         # Slightly conservative default; user can override in Designer or from code
-        self._spin.setMaximum(max(1, cpu_count()))
+        self._spin.setMaximum(available_cpu_count())
 
         layout.addWidget(self._label)
         layout.addWidget(self._spin)

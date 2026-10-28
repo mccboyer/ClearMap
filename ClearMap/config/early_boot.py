@@ -22,12 +22,12 @@ import tempfile
 from functools import cached_property
 from typing import Optional, TypedDict, Any, Dict, TypeAlias
 
+from ClearMap import __version__
 from ClearMap.config.config_handler import ConfigHandler
-from importlib_metadata import version as _pkg_version
 
 from PyQt5.QtWidgets import QFileDialog, QMessageBox, QInputDialog
 
-from ClearMap.config.utils import parse_flat_yaml, write_flat_yaml
+from ClearMap.config.utils import parse_flat_yaml, set_flat_yaml_value
 from ClearMap.gui.gui_utils_base import ensure_qapp, is_headless
 
 SENTINEL_DIR = pathlib.Path.home() / '.clearmap' / '.first_run_sentinels'
@@ -40,7 +40,7 @@ class MachineConfig:
     Minimal, side-effect-free reader for machine config.
     Caches the parsed file; exposes DEFAULT section as a mapping.
     """
-    _version = _pkg_version('ClearMap')  # required early for filename
+    _version = __version__  # required early for filename
 
     def __init__(self):
         self.min_temp_folder_gb = 5
@@ -71,15 +71,11 @@ class MachineConfig:
             raise FileNotFoundError(f'Packaged default machine config not found: {default_path}.'
                                     f'Please check your ClearMap installation.')
 
-        user_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(default_path, user_path)
-        return user_path
+        return ConfigHandler.copy_if_missing(default_path, user_path)
 
     def _patch_temp_dir_cfg(self, path_str: str):
-        cfg = self._read_cfg()
-        cfg['temp_folder'] = path_str
-        # write back atomically
-        write_flat_yaml(self.cfg_path, cfg)
+        self._ensure_cfg_exists()
+        set_flat_yaml_value(self.cfg_path, 'temp_folder', path_str)  # edit specific line only. keep comments
 
     def _patch_temp_dir_env(self, path_str: str):
         for var in ('TMP', 'TEMP', 'TMPDIR'):
@@ -312,6 +308,7 @@ def first_boot(*, allow_prompt: bool = True) -> BootResult:
     if (not graphics_resources_py_rc_path.exists() or
             graphics_resources_qrc_path.stat().st_mtime > graphics_resources_py_rc_path.stat().st_mtime):
         subprocess.run(['pyrcc5', graphics_resources_qrc_path, '-o', graphics_resources_py_rc_path], check=True)
+    import ClearMap.gui.creator.graphics_resources_rc  # noqa: F401  (the images of the help, ':/graphics_resources/')
 
     is_first_run = _is_first_run(version_tag)
 

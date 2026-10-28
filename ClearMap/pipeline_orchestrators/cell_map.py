@@ -92,6 +92,8 @@ import pandas as pd
 
 # noinspection PyPep8Naming
 import ClearMap.IO.IO as clearmap_io
+from ClearMap.IO import io_ops
+from ClearMap.IO.assets_specs import weighted_sub_type
 from ClearMap.IO.workspace2 import Workspace2
 
 # noinspection PyPep8Naming
@@ -103,8 +105,9 @@ import ClearMap.ImageProcessing.Experts.Cells as cell_detection
 # noinspection PyPep8Naming
 import ClearMap.Analysis.Measurements.Voxelization as voxelization
 
-from ClearMap.Utils.exceptions import MissingRequirementException
-from ClearMap.Utils.utilities import requires_assets, FilePath, sanitize_n_processes
+from ClearMap.Utils.exceptions import MissingRequirementException, MissingAssetError, AssetNotFoundError
+from ClearMap.Utils.utilities import sanitize_n_processes
+from ClearMap.IO.asset_requirements import requires_assets, RequiredAsset
 
 from ClearMap.config.config_coordinator import ConfigCoordinator
 
@@ -128,6 +131,7 @@ USE_BINARY_POINTS_FILE = not platform.system().lower().startswith('darwin')
 
 class CellDetector(ChannelPipelineOrchestrator):
 
+    pipeline = 'CellMap'
     config_name = 'cell_map'
 
     def __init__(self, sample_manager: SampleManager = None, config_coordinator: ConfigCoordinator = None,
@@ -144,15 +148,21 @@ class CellDetector(ChannelPipelineOrchestrator):
                              f'that matches one in the sample_params file.')
         self.setup(sample_manager, channel, registration_processor)
 
-    def setup(self, sample_manager, channel_name, registration_processor):
+    def setup(self, sample_manager=None, channel_name=None, registration_processor=None):
+        """
+        Register the channel in the workspace once the sample is ready for it (see sample_ready).
+        Idempotent: what is not given (sample manager, channel, registration processor) is the one
+        already set, so that it can be called again without argument, e.g. by setup_if_needed.
+        """
         self.sample_manager = sample_manager if sample_manager else self.sample_manager
-        self.channel = channel_name
-        self.registration_processor = registration_processor
-        if self.sample_manager.setup_complete:
-            self.workspace = sample_manager.workspace
-            self.setup_complete = True
+        self.channel = channel_name if channel_name is not None else self.channel
+        self.registration_processor = registration_processor if registration_processor is not None else self.registration_processor
+        if self.sample_ready:
+            self.workspace = self.sample_manager.workspace
+            self.register_in_workspace()
+            self._setup_done = True
         else:
-            self.setup_complete = False
+            self._setup_done = False
             warnings.warn('SampleManager not setup, CellDetector setup incomplete')
 
     @property
@@ -206,10 +216,10 @@ class CellDetector(ChannelPipelineOrchestrator):
         suffix = 'counts'
         weights = None
         if weights_column:
-            suffix += f'_{weights_column}'
+            suffix = weighted_sub_type(suffix, weights_column)  # Formerly counts_<weights_column> (still read)
             title += f' weighted by {weights_column}'
             weights = self.get_cells_df()[weights_column]
-        counts_asset = self.get('density', channel=self.channel, asset_sub_type=suffix)
+        counts_asset = self.get('density', channel=self.channel, suffix=suffix)  # suffix: the sub-type may be dynamic
         counts_asset.delete(missing_ok=True)  # Remove previous counts file if exists
         self.set_watcher_step(title)
 
@@ -217,7 +227,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         self.update_watcher_main_progress()
         return coordinates, counts_asset.path
 
-    @requires_assets([FilePath('density', asset_sub_type='counts')])
+    @requires_assets([RequiredAsset('density', asset_sub_type='counts')])
     def plot_voxelized_counts(self, arrange=True, parent=None):
         import ClearMap.Visualization.Plot3d as plot_3d
         scale = self.channel_cfg_view('registration')['resampled_resolution']
@@ -259,8 +269,13 @@ class CellDetector(ChannelPipelineOrchestrator):
         kwargs = {'asset_type': 'cells', 'channel': self.channel, 'asset_sub_type': coord_type}
 
         table_path = self.get_path(**kwargs, extension='.feather')
-        if not table_path.exists:
-            table_path = self.get_path(**kwargs)
+        if not table_path.exists():
+            table_path = self.get_path(**kwargs, extension='.npy')  # Old tables
+        if not table_path.exists():
+            raise AssetNotFoundError(f'No cells table ({coord_type}) for channel {self.channel} '
+                                     f'with extension .feather or .npy',
+                                     asset_path=str(table_path.with_suffix('.feather')), asset_type='cells',
+                                     asset_sub_type=coord_type, missing_step_name='cell detection')
 
         loaders = {'.feather': pd.read_feather, '.npy': np.load}
         table = loaders[table_path.suffix](table_path)
@@ -278,7 +293,7 @@ class CellDetector(ChannelPipelineOrchestrator):
 
         if self.registration_processor.was_registered:  # FIXME: check if should be registered and raise error
             coordinates_transformed = self.transform_coordinates(coordinates)
-            annotator = self.registration_processor.annotators[self.channel]
+            annotator = self.registration_processor.annotator_of(self.channel)
             ref_channel_cfg = self.get_alignment_ref_channel_reg_cfg()
             atlas_resolution = ref_channel_cfg['resampled_resolution']
             extra_columns = annotator.get_columns(coordinates_transformed, atlas_resolution)  # OPTIMISE: parallel
@@ -298,17 +313,12 @@ class CellDetector(ChannelPipelineOrchestrator):
                 resampled_shape = self.get('atlas', channel=self.channel, asset_sub_type='reference').shape()
             else:
                 raise ValueError(f'Resampled shape not found for channel {self.channel}')
-        coords = resampling.resample_points(
-            coords,
-            original_shape=self.sample_manager.stitched_shape(channel=self.channel),
-            resampled_shape=resampled_shape)
+        coords = resampling.resample_points(coords,
+                                            original_shape=self.sample_manager.stitched_shape(channel=self.channel),
+                                            resampled_shape=resampled_shape)
 
         if self.registration_processor.was_registered:
-            reg_cfg = self.registration_config['channels']
-            for i, channel in enumerate(self.get_registration_sequence_channels(stop_channel=target_channel)):
-                if reg_cfg[channel]['moving_channel'] in (None, 'intrinsically_aligned'):
-                    continue
-                results_dir = self.registration_processor.get_path('aligned', channel=channel).parent
+            for results_dir in self.registration_processor.get_transform_directories(self.channel, target_channel):
                 coords = elastix.transform_points(coords, transform_directory=results_dir, binary=USE_BINARY_POINTS_FILE)
 
         return coords
@@ -319,7 +329,7 @@ class CellDetector(ChannelPipelineOrchestrator):
             'size': self.config['cell_filtration']['thresholds']['size']
         }
         src_path = self.get_path('cells', channel=self.channel, asset_sub_type='raw')
-        if not src_path.exists:
+        if not src_path.exists():
             raise MissingRequirementException(f'Cell detection not run yet (no file found at "{src_path}"),'
                                               f' cannot filter cells. Please run cell detection first.')
         dest_path = self.get_path('cells', channel=self.channel, asset_sub_type='filtered')
@@ -329,7 +339,7 @@ class CellDetector(ChannelPipelineOrchestrator):
             uncrusted_coords, mask = self.remove_crust(coordinates=filtered_coords,
                                                        threshold=distance_from_surface_px, return_mask=True)
             table = table[mask]
-            clearmap_io.write(dest_path, table)  # Overwrite filtered with uncrusted
+            io_ops.write(dest_path, table)  # Overwrite filtered with uncrusted
 
     def run_cell_detection(self, tuning=False, save_maxima=False, save_shape=False, save_as_binary_mask=False):
         self.workspace.debug = tuning  # TODO: use context manager
@@ -367,7 +377,10 @@ class CellDetector(ChannelPipelineOrchestrator):
                                     overlap=block_params['overlap'], verbose=True)
 
         # TODO: round to processors
-        n_steps = self.get_n_blocks(self.get('stitched', channel=self.channel).shape()[2])
+        stitched_asset = self.get('stitched', channel=self.channel)
+        if not stitched_asset.exists:
+            raise MissingAssetError(f'Stitched asset does not exist @ {stitched_asset.path}')
+        n_steps = self._get_n_blocks(stitched_asset.shape()[2])
         self.prepare_watcher_for_substep(n_steps, self.cell_detection_re, 'Detecting cells')
         try:
             dest_asset = self.get('cells', channel=self.channel, asset_sub_type='raw')
@@ -420,7 +433,7 @@ class CellDetector(ChannelPipelineOrchestrator):
 
             collapsed = pd.concat((collapsed, tmp))
 
-        annotator = self.registration_processor.annotators[self.channel]
+        annotator = self.registration_processor.annotator_of(self.channel)
         if all_regions:  # Add regions even if they are empty
             uniq_ids = np.unique(annotator.atlas)
             tmp = pd.DataFrame({'Structure ID': uniq_ids, 'mock': ''})
@@ -460,11 +473,11 @@ class CellDetector(ChannelPipelineOrchestrator):
                 return
 
         asset = self.get(**asset_properties)
-        requirements = [asset, self.df_path]
-        if any(not req.exists for req in requirements):
+        requirements = [(asset, asset.exists), (self.df_path, self.df_path.exists())]  # asset.exists is a property
+        if not all(ok for _, ok in requirements):
             raise MissingRequirementException(f'Cannot plot 3D scatter with atlas colors',
-                                              missing_items=[e for e in requirements if not e.exists],
-                                              found_items=[e for e in requirements if e.exists])
+                                              missing_items=[r for r, ok in requirements if not ok],
+                                              found_items=[r for r, ok in requirements if ok])
         dv = qplot_3d.plot(asset.path, title=f'{asset_properties["asset_type"].title()} and cells',  # FIXME: correct scaling for anisotropic if raw
                            arrange=False, lut='white', parent=parent)[0]
 
@@ -482,7 +495,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         else:
             coordinates = df[['xt', 'yt', 'zt']].values.astype(int)  # required to match integer z
             dv.atlas = self.get('atlas', channel=self.channel, asset_sub_type='annotation').read()
-            dv.structure_names = self.registration_processor.annotators[self.channel].get_names_map()
+            dv.structure_names = self.registration_processor.annotator_of(self.channel).get_names_map()
         if 'hemisphere' in df.columns:
             hemispheres = df['hemisphere']
         else:
@@ -490,7 +503,7 @@ class CellDetector(ChannelPipelineOrchestrator):
 
         if 'id' in df.columns:
             unique_ids = np.sort(np.unique(df['id']))
-            annotator = self.registration_processor.annotators[self.channel]
+            annotator = self.registration_processor.annotator_of(self.channel)
             # color_map = {id_: annotator.find(id_, key='id')['rgb'] for id_ in unique_ids}
             color_map = {id_: annotator.convert_label(id_, key='id', value='color_hex_triplet') for id_ in unique_ids}
             color_map[0] = np.array(to_hex((1, 0, 0)))  # default to red
@@ -509,7 +522,7 @@ class CellDetector(ChannelPipelineOrchestrator):
     @property
     def df_path(self):
         feather_path = self.get_path('cells', channel=self.channel, extension='.feather')
-        if feather_path.exists:
+        if feather_path.exists():
             return feather_path
         else:
             return self.get_path('cells', channel=self.channel)
@@ -521,7 +534,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         else:
             return pd.DataFrame(np.load(df_path))
 
-    @requires_assets([FilePath('cells', asset_sub_type='filtered'), FilePath('stitched')])
+    @requires_assets([RequiredAsset('cells', asset_sub_type='filtered'), RequiredAsset('stitched')])
     def plot_filtered_cells(self, parent=None, smarties=False):
         import ClearMap.Visualization.Qt.Plot3d as qplot_3d
         from ClearMap.Visualization.Qt.widgets import Scatter3D
@@ -544,7 +557,7 @@ class CellDetector(ChannelPipelineOrchestrator):
     def plot_background_subtracted_img(self):
         import ClearMap.Visualization.Plot3d as plot_3d
         src = self.get('cells', channel=self.channel, asset_sub_type='raw').open_ro()
-        coordinates = np.hstack([src[c][:, None] for c in 'xyz'])
+        coordinates = np.column_stack([np.asarray(src[c]) for c in 'xyz'])
         p = plot_3d.list_plot_3d(coordinates)
         return plot_3d.plot_3d(self.get_path('stitched', channel=self.channel),
                                view=p, cmap=plot_3d.grays_alpha(alpha=1))
@@ -577,7 +590,7 @@ class CellDetector(ChannelPipelineOrchestrator):
             self.get_path('cells', channel=self.channel, asset_sub_type='bkg'),
             self.get_path('cells', channel=self.channel, asset_sub_type='shape')
         ]
-        sources = [s for s in sources if s.exists]  # Remove missing files (if not tuning)
+        sources = [s for s in sources if s.exists()]  # Remove missing files (if not tuning)
         if not sources:
             raise MissingRequirementException('No files found for preview')
         titles = [s.name for s in sources]
@@ -603,7 +616,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         density_path = self.get_path('density', channel=self.channel, asset_sub_type='intensities')
         return plot_3d.plot(density_path, arrange=arrange)
 
-    def get_n_blocks(self, dim_size):
+    def _get_n_blocks(self, dim_size):
         raw_cfg = self.cfg_coordinator.get_config_view(self.config_name)
         perf_params = raw_cfg['performance']['channels'][self.channel]['detection']['block_processing']
         blk_size = perf_params['size_max']
@@ -626,21 +639,24 @@ class CellDetector(ChannelPipelineOrchestrator):
         """
         warnings.warn('Method "export_to_clearmap1_fmt" is deprecated and will be removed in future versions;'
                       'please use the new formats from atlas_align and export_collapsed_stats', DeprecationWarning, 2)
-        source = self.get('cells', channel=self.channel).read()
+        cells = self.get_cells_df()  # Feather table or legacy structured .npy, always as a DataFrame
         clearmap1_format = {'points': ['x', 'y', 'z'],
                             'points_transformed': ['xt', 'yt', 'zt'],
                             'intensities': ['source', 'dog', 'background', 'size']}
         for sub_type, names in clearmap1_format.items():
-            sink = self.get_path('cells', channel=self.channel, asset_sub_type=f'ClearMap1{sub_type}')
-            data = np.array(
-                [source[name] if name in source.dtype.names else np.full(source.shape[0], np.nan) for name in names]
-            )
-            data = data.T
-            clearmap_io.write(sink, data)
+            # ClearMap1 reads plain (n, k) .npy arrays. Without an explicit extension, the sink would
+            # resolve to the table default (.feather), which cannot hold a bare array.
+            sink = self.get_path('cells', channel=self.channel, asset_sub_type=f'ClearMap1{sub_type}',
+                                 extension='.npy')
+            data = cells.reindex(columns=names).to_numpy()  # missing columns become NaN, as before
+            io_ops.write(sink, data)
 
     def convert_cm2_to_cm2_1_fmt(self):
-        """Atlas alignment and annotation """
-        cells = self.get('cells', channel=self.channel).read()
+        """Convert a ClearMap 2.0 cells file (structured .npy) to the annotated 2.1+ Feather table."""
+        npy_path = self.get_path('cells', channel=self.channel, extension='.npy')
+        if not npy_path.exists():
+            raise MissingRequirementException(f'No ClearMap 2.0 cells file found at "{npy_path}"; nothing to convert.')
+        cells = pd.DataFrame(np.load(npy_path))  # structured array: field names become columns
         df = pd.DataFrame({ax: cells[ax] for ax in 'xyz'})
         df['size'] = cells['size']
         df['source'] = cells['source']
@@ -651,7 +667,7 @@ class CellDetector(ChannelPipelineOrchestrator):
 
         coordinates_transformed = np.vstack([cells[f'{ax}t'] for ax in 'xyz']).T
 
-        annotator = self.registration_processor.annotators[self.channel]
+        annotator = self.registration_processor.annotator_of(self.channel)
         hemisphere_label = annotator.label_points_hemispheres(coordinates_transformed)
 
         unique_labels = np.sort(df['order'].unique())  # WARNING: ClearMap2 used order as key (now deprecated)
@@ -660,7 +676,7 @@ class CellDetector(ChannelPipelineOrchestrator):
         id_map = {lbl: annotator.find(lbl, key='order')['id'] for lbl in unique_labels}
 
         atlas = self.get('atlas', channel=self.channel, asset_sub_type='annotation').read()
-        atlas_scale = np.prod(self.get_alignment_ref_channel_reg_cfg['resampled_resolution'])
+        atlas_scale = np.prod(self.get_alignment_ref_channel_reg_cfg()['resampled_resolution'])
         volumes = {_id: (atlas == _id).sum() * atlas_scale for _id in
                    id_map.values()}  # Volumes need a lookup on ID since the atlas is in ID space
 
@@ -670,7 +686,3 @@ class CellDetector(ChannelPipelineOrchestrator):
         df['volume'] = df['id'].map(volumes)
 
         df.to_feather(self.get_path('cells', channel=self.channel, extension='.feather'))
-
-    def get_registration_sequence_channels(self, stop_channel='atlas'):
-        return (self.registration_processor.
-                get_registration_sequence_channels(self.channel, stop_channel))

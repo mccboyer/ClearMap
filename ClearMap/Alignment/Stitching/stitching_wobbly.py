@@ -18,21 +18,23 @@ import warnings
 
 import numpy as np
 import functools as ft
-import multiprocessing as mp
 
-
-import ClearMap.IO.IO as io
-import ClearMap.IO.Slice as slc
+from ClearMap.IO import io_ops, FileUtils as file_utils
+import ClearMap.IO.source.Slice as slc
+from ClearMap.IO.source.backends import mmp_backend
+from ClearMap.IO.source.backends.file_list_backend import file_list
 
 import ClearMap.Alignment.Stitching.stitching_rigid as strg
 import ClearMap.Alignment.Stitching.Tracking as trk
 
 import ClearMap.ParallelProcessing.ParallelTraceback as ptb
+from ClearMap.ParallelProcessing import SharedMemoryArray as shared_memory_array
+from ClearMap.ParallelProcessing.SharedMemoryManager import SharedMemmoryManager
 
 import ClearMap.Utils.Timer as tmr
 import ClearMap.Utils.tag_expression as te
 
-from ClearMap.Utils.utilities import CancelableProcessPoolExecutor
+from ClearMap.Utils.utilities import CancelableProcessPoolExecutor, sanitize_n_processes
 
 
 from ClearMap.Alignment.Stitching.layout_graph_utils import cluster_components
@@ -42,7 +44,7 @@ from ClearMap.Alignment.Stitching.layout_graph_utils import cluster_components
 ###  Layout
 ###############################################################################
 
-class WobblySource(strg.Source):
+class WobblyStitchSource(strg.StitchSource):
     """Class to handle source data and positions of wobbly stacks."""
 
     ISOLATED = -2
@@ -67,25 +69,21 @@ class WobblySource(strg.Source):
         wobble : list of list of ints or None
           The positions of the individual planes in this wobbly source.
         """
-        strg.Source.__init__(self, source = source, position = position, tile_position = tile_position)
+        strg.StitchSource.__init__(self, source = source, position = position, tile_position = tile_position)
 
         self._axis = int(axis)
 
         if wobble is None:
-            shape = super(WobblySource, self).shape
+            shape = super(WobblyStitchSource, self).shape
             self._wobble = np.zeros((shape[self._axis], len(shape) - 1), dtype = int)
         else:
             self._wobble = np.array(wobble, dtype = int)
 
         if status is None:
-            shape = super(WobblySource, self).shape
+            shape = super(WobblyStitchSource, self).shape
             self._status = np.full(shape[self._axis], self.VALID, dtype = int)
         else:
             self._status = np.array(status, dtype = int)
-
-    @property
-    def name(self):
-        return 'Wobbly-' + self.source.name
 
     @property
     def axis(self):
@@ -400,8 +398,6 @@ class WobblySource(strg.Source):
         return new
 
 
-
-
 class WobblyAlignment(strg.Alignment):
 
     NOSIGNAL = -5
@@ -677,7 +673,7 @@ class WobblyLayout(strg.TiledLayout):
 
         # convert sources to WobblySources
         sources = self.sources
-        self.sources = [WobblySource(source = s, axis = axis) for s in sources]
+        self.sources = [WobblyStitchSource(source = s, axis = axis) for s in sources]
 
         alignments = []
         sources_to_wobbly_sources = {s : w for s,w in zip(sources, self.sources)}
@@ -757,7 +753,7 @@ class WobblyLayout(strg.TiledLayout):
         for source in sources:
             position = source.wobble_at_coordinate(coordinate)
             slicing = (slice(None),) * axis + (coordinate - source.coordinate,) + (slice(None),) * (ndim-1-axis)
-            sliced_sources.append(strg.Source(source = slc.Slice(source=source.source.as_virtual(), slicing=slicing), position=position, tile_position=source.tile_position))
+            sliced_sources.append(strg.StitchSource(source = slc.Slice(source=source.source.as_virtual(), slicing=slicing), position=position, tile_position=source.tile_position))
 
         if self._shape is not None:
             shape = self._shape[:axis] + self._shape[axis+1]
@@ -838,7 +834,7 @@ class Verbose:
         if self.directory is None:
             return filename
         else:
-            return io.join(self.directory, filename)
+            return file_utils.join(self.directory, filename)
 
     def create_directory(self, prefix = None):
         if self.directory is None:
@@ -847,8 +843,8 @@ class Verbose:
             if prefix is not None:
                 directory = f'{prefix}_{directory}'
             self.directory = directory
-        if not io.is_directory(self.directory):
-            io.create_directory(self.directory)
+        if not file_utils.is_directory(self.directory):
+            file_utils.create_directory(self.directory)
         return self.directory
 
 
@@ -891,10 +887,9 @@ def align_layout(layout, axis_range=None, max_shifts=10, axis_mip=None,
                         find_shifts=find_shifts,
                         verbose=verbose)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_align(a.pre, a.post) for a in alignments]
     else:
         layout.sources_as_virtual()
@@ -1384,7 +1379,7 @@ def inspect_align_layout(alignment, verbose):
 
     #minima
     positions_expression = verbose.full_filename(te.Expression(f'positions_{verbose.save}_<s>_<e>.npy'))
-    positions_files = io.file_list(positions_expression)
+    positions_files = file_list(positions_expression)
 
     minima = []
     for p in positions_files:
@@ -1397,7 +1392,7 @@ def inspect_align_layout(alignment, verbose):
 
     #potential trajectories
     trajectory_expression = verbose.full_filename(te.Expression(f'trajectories_{verbose.save}_<s>_<e>.npy'))
-    trajectory_files = io.file_list(trajectory_expression)
+    trajectory_files = file_list(trajectory_expression)
     paths = []
     for t in trajectory_files:
         values = trajectory_expression.values(t)
@@ -1412,7 +1407,7 @@ def inspect_align_layout(alignment, verbose):
 
     #optimal trajectory
     trajectory_expression = verbose.full_filename(te.Expression(f'trajectory_opt_{verbose.save}_<s>_<e>.npy'))
-    trajectory_files = io.file_list(trajectory_expression)
+    trajectory_files = file_list(trajectory_expression)
     opt_paths = []
     for t in trajectory_files:
         values = trajectory_expression.values(t)
@@ -1486,10 +1481,9 @@ def place_layout(layout, min_quality = None, method = 'optimization',
     #place each slice
     _place = ft.partial(_place_slice, positions=positions, alignment_pairs=alignment_pairs, min_quality=min_quality)
 
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         results = [_place(d,q,s) for d,q,s in zip(displacements, qualities, status)]
     else:
         with CancelableProcessPoolExecutor(processes) as executor:
@@ -1668,6 +1662,7 @@ def _place_slice_component(positions, alignment_pairs, displacements, fixed = No
 
 def _optimize_slice_positions(positions, components, processes = None, workspace=None, verbose = False):
     """Helper to optimize the positions of the slices on top of each other"""
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
     # Setting:
     # refer to the slice components as 'clusters'
@@ -1737,8 +1732,8 @@ def _optimize_slice_positions(positions, components, processes = None, workspace
 
 
         # construct x, M
-        X = [io.sma.zeros(n_s) for d in range(ndim)]
-        M = [io.sma.zeros((n_s, n_s)) for d in range(ndim)]
+        X = [shared_memory_array.zeros(n_s) for d in range(ndim)]
+        M = [shared_memory_array.zeros((n_s, n_s)) for d in range(ndim)]
         for ci, c in enumerate(cluster_component[1:]):
             #if verbose and ci % 100 == 0:
             #  print('Placement: constructing constraints %d/%d!' % (ci, n_clusters))
@@ -1788,9 +1783,9 @@ def _optimize_slice_positions(positions, components, processes = None, workspace
         #print M
         #print np.linalg.pinv(-M)
 
-        if isinstance(processes, int) and processes > 1:
-            M = [io.sma.smm.insert(m) for m in M]
-            X = [io.sma.smm.insert(x) for x in X]
+        if processes > 1:
+            M = [SharedMemmoryManager.insert(m) for m in M]
+            X = [SharedMemmoryManager.insert(x) for x in X]
             with CancelableProcessPoolExecutor(min(processes, ndim)) as executor:
                 shifts = executor.map(_optimize_shifts, M, X)
                 if workspace is not None:
@@ -1822,15 +1817,15 @@ def _optimize_slice_positions(positions, components, processes = None, workspace
 
 
 def _optimize_shifts(MM, XX):
-    M = io.sma.smm.get(MM)
-    X = io.sma.smm.get(XX)
+    M = SharedMemmoryManager.get(MM)
+    X = SharedMemmoryManager.get(XX)
 
     #ss = np.dot(np.linalg.pinv(-M), X);
     ss = np.linalg.lstsq(-M, X, rcond=None)[0]
     #ss = scipy.sparse.linalg.lsqr(-M, X)[0];
 
-    io.sma.smm.free(MM)
-    io.sma.smm.free(XX)
+    SharedMemmoryManager.free(MM)
+    SharedMemmoryManager.free(XX)
 
     return np.asarray(np.round(ss), dtype=int)
 
@@ -2074,8 +2069,8 @@ def stitch_layout(layout, sink, method = 'interpolation', processes = None, verb
       The layout of the stacks to stitch.
     method : 'interpolation', 'max', 'min', 'mean'
       The method to use to stitch the sources.
-    processes : int or 'serial'
-      Number of processor to use for parallel processing, if 'serial' process in serial.
+    processes : int or None
+      Number of processor to use for parallel processing, 0: in the calling process (no subprocess).
     verbose : bool
       If True, print progress information.
 
@@ -2097,8 +2092,8 @@ def stitch_layout(layout, sink, method = 'interpolation', processes = None, verb
     shape = layout.shape_wobbly
 
     # create sink
-    #TODO: make layout a sink ! use io.create
-    io.mmp.create(sink, shape=shape, dtype=layout.dtype, order=layout.order)
+    #TODO: make layout a sink ! use io_ops.create
+    mmp_backend.create(sink, shape=shape, dtype=layout.dtype, order=layout.order)
 
     # create slices
     coordinates = np.arange(origin[axis], origin[axis] + shape[axis])
@@ -2116,10 +2111,9 @@ def stitch_layout(layout, sink, method = 'interpolation', processes = None, verb
                          axis=axis, full_region=full_region, verbose=verbose)
 
     # stitch the data
-    if not isinstance(processes, int) and processes != 'serial':
-        processes = mp.cpu_count()
+    processes = sanitize_n_processes(processes, can_run_in_calling_process=True)
 
-    if processes == 'serial':
+    if processes == 0:
         [_stitch(l,i) for i,l in enumerate(layout_slices)]
     else:
         #for l in layout_slices:
@@ -2162,7 +2156,7 @@ def _stitch_slice(slice_layout, slice_id, n_slices, sink, method, axis, full_reg
     #stitch
     stitched = strg.stitch_layout(slice_layout, method = method)
 
-    io.write(sink, stitched[slice_slicing], slicing = full_slicing)
+    io_ops.write(sink, stitched[slice_slicing], slicing = full_slicing)
 
 
 #############################################################################################################
@@ -2171,6 +2165,7 @@ def _stitch_slice(slice_layout, slice_id, n_slices, sink, method, axis, full_reg
 
 def _test():
     import ClearMap.Alignment.Stitching.stitching_wobbly as stw
+    from ClearMap.IO import io_ops
 
     from importlib import reload
     reload(stw)
@@ -2196,19 +2191,19 @@ def _test():
     plt.plot(wobble[:,0])
 
     l = stw.WobblyLayout([data1, data2], overlaps = 20)
-    stw.align_layout(l, max_shifts = 20, verbose = True, processes = 'serial', stack_validation_params= True, find_shifts ='tracing')
+    stw.align_layout(l, max_shifts = 20, verbose = True, processes = 0, stack_validation_params= True, find_shifts ='tracing')
 
     a = l.alignments[0]
     a.plot_overlay_wobbly()
 
-    stw.place_layout(l, method='!optimization', smooth = None, lower_to_origin=True, verbose = True, processes = 'serial')
+    stw.place_layout(l, method='!optimization', smooth = None, lower_to_origin=True, verbose = True, processes = 0)
 
-    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 'serial')
+    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 0)
 
     stw.strg.p3d.plot(s)
 
     #true if not optimized
-    np.all(stw.io.open_ro(s)[:190,:,:] == data[:190,:,:nz])
+    np.all(io_ops.open_ro(s)[:190, :, :] == data[:190, :, :nz])
 
 
     plt.figure(2); plt.clf()
@@ -2243,11 +2238,11 @@ def _test():
     reload(stw.strg)
     reload(stw)
     l = stw.WobblyLayout([data1, data2], overlaps = 20)
-    stw.align_layout(l, max_shifts = 20, verbose = True, processes = 'serial', stack_validation_params= False)
+    stw.align_layout(l, max_shifts = 20, verbose = True, processes = 0, stack_validation_params= False)
 
-    stw.place_layout(l, method='!optimization',  lower_to_origin=True, smooth = None, verbose = True, processes = 'serial')
+    stw.place_layout(l, method='!optimization',  lower_to_origin=True, smooth = None, verbose = True, processes = 0)
 
-    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 'serial')
+    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 0)
 
     plt.figure(2); plt.clf()
     for s in l.sources:
@@ -2256,7 +2251,7 @@ def _test():
 
 
     # True for non-optimized placements
-    np.all(stw.io.open_ro(s)[:190,:,:] == data[:190,:,:nz])
+    np.all(io_ops.open_ro(s)[:190, :, :] == data[:190, :, :nz])
 
 
     # wobble + axis alignment
@@ -2304,12 +2299,12 @@ def _test():
 
     stw.place_layout(l, method = 'optimization',  lower_to_origin=True, smooth = None, min_quality=-np.inf, processes = '!serial', verbose = True)
 
-    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 'serial')
+    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 0)
 
     stw.strg.dv.plot(s)
 
     # True for non-optimized placements
-    np.all(stw.io.open_ro(s)[:190,:,sh:nz] == data[:190,:,sh:nz])
+    np.all(io_ops.open_ro(s)[:190, :, sh:nz] == data[:190, :, sh:nz])
 
 
     plt.figure(2); plt.clf()
@@ -2372,7 +2367,7 @@ def _test():
                      prepare = 'normalization',
                      slice_validation_params= dict(method='foreground', valid_range = (1, None), size = None),
                      find_shifts = dict(method='tracing', cutoff=np.sqrt(2 * 3**2), debug = True),
-                     verbose = True, processes = 'serial')
+                     verbose = True, processes = 0)
 
     a = l.alignments[0]
     plot_status(a, fig=2)
@@ -2428,17 +2423,17 @@ def _test():
                      prepare='normalization',
                      slice_validation_params=dict(method='foreground', valid_range=(1, None), size=None),
                      find_shifts = dict(method='tracing', cutoff=np.sqrt(2 * 3**2), debug = False),
-                     verbose = True, processes = 'serial')
+                     verbose = True, processes = 0)
     stw.place_layout(l, method = '!optimization',  lower_to_origin=True, min_quality=-np.inf,
                      smooth = None, smooth_optimized = dict(method='window', window_length=10, binary = 2),
                      processes = '!serial', verbose = True)
 
-    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 'serial')
+    s = stw.stitch_layout(l, sink = 'test.npy', method='max', processes = 0)
 
     stw.strg.dv.plot(s)
 
     # True for non-optimized placements
-    np.all(stw.io.open_ro(s)[:190,:,sh:nz] == data[:190,:,sh:nz])
+    np.all(io_ops.open_ro(s)[:190, :, sh:nz] == data[:190, :, sh:nz])
 
 
     s = l.slice_along_axis_wobbly(32)
@@ -2458,7 +2453,6 @@ def _test():
 
     ### Test on real data
     import numpy as np
-    import ClearMap.IO.IO as io
     import ClearMap.Alignment.Stitching.stitching_rigid as stg
     import ClearMap.Alignment.Stitching.stitching_wobbly as stw
     import ClearMap.IO.Workspace as wsp
@@ -2466,7 +2460,7 @@ def _test():
     directory = '/home/ckirst/Science/Projects/WholeBrainClearing/Vasculature/Experiment/Stitching_2018_06'
     expression = 'tiny_[<Y,2> x <X,2>]_C00.ome.npy'
     ws = wsp.Workspace(name = 'test', directory = directory, expression=expression)
-    io.file_list(ws.filename('expression'))
+    file_list(ws.filename('expression'))
 
     l = stw.WobblyLayout(expression = ws.filename('expression'), tile_axes = ['X', 'Y'], overlaps = (25, 155))
 

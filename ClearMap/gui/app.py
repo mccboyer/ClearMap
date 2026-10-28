@@ -52,7 +52,6 @@ from copy import deepcopy
 
 from typing import Optional, Callable, List, Dict, Type, Any, Iterable, Tuple
 import atexit
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
 
 from statistics import mode
@@ -160,9 +159,15 @@ from ClearMap.Visualization.Qt.DataViewer import DataViewer
 
 from ClearMap.Alignment.Stitching import layout_graph_utils  # noqa: F401 # WARNING: first because otherwise, breaks with pytorch
 
-from ClearMap.Utils.utilities import title_to_snake, snake_to_title, deep_merge
-from ClearMap.Utils.event_bus import EventBus, BusSubscriberMixin
-from ClearMap.Utils.events import (CfgChanged, UiRequestRefreshTabs, UiTabActivated, TabActivationResult,
+from ClearMap.Utils.utilities import title_to_snake, snake_to_title
+from ClearMap.config.config_adjusters.patch_ops import deep_merge
+from ClearMap.Utils.nvidia_utils import cuda_available
+from ClearMap.Utils.event_bus import EventBus, BusSubscriberMixin, GUI_THREAD
+from ClearMap.Utils.progress import ProgressWatcher
+from ClearMap.Utils.events import (ProgressMainStepNameChanged, ProgressSubStepNameChanged, ProgressMainValueChanged,
+                                   ProgressMainMaximumChanged, ProgressSubValueChanged, ProgressSubMaximumChanged,
+                                   ProgressFinished,
+                                   CfgChanged, UiRequestRefreshTabs, UiTabActivated, TabActivationResult,
                                    TabsUpdated,  ChannelsSnapshot, ChannelDefaultsChanged)
 
 from ClearMap.config.update_config import update_default_config
@@ -172,6 +177,7 @@ from ClearMap.config.config_handler import ConfigHandler, CLEARMAP_CFG_DIR, ALTE
 
 from ClearMap.gui.gui_utils_images import get_current_res
 from ClearMap.gui.tab_registry import TabRegistry
+from ClearMap.gui.event_delivery import GuiThreadDelivery
 from ClearMap.gui.widget_monkeypatch_callbacks import recursive_patch_widgets
 from ClearMap.pipeline_orchestrators.sample_info_management import SampleManager
 from ClearMap.pipeline_orchestrators.experiment_controller import ExperimentController, AnalysisGroupController, \
@@ -211,15 +217,17 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
     progress bars and performance monitors and appearance.
     Anything more application related is coded in the child class.
     """
-    def __init__(self):
+    def __init__(self, bus: EventBus):
         super().__init__()
+        self.bus = bus
         self.graphs = []
         self._reload_icon = self.style().standardIcon(QStyle.SP_BrowserReload)
         self.logger = None
         self.progress_logger = Printer(logger_type='progress')
         self.error_logger = None
         self.progress_dialog = None
-        self.progress_watcher = cmp_widgets.ProgressWatcher(timer_interval_ms=250)
+        self.progress_watcher = ProgressWatcher(bus, timer_interval_ms=250)
+        self._subscribe_the_progress_dialog()
 
         self.default_font_size = self.compute_default_font_size()
 
@@ -229,13 +237,11 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
         self.gpu_bar = QProgressBar() # noqa
         self.vram_bar = QProgressBar() # noqa
 
-        if torch.cuda.is_available():
-            gpu_period = 500
-        else:
-            gpu_period = None
+        gpu_available = cuda_available()
+        gpu_period = 500 if gpu_available else None
         self.perf_monitor = cmp_widgets.PerfMonitor(self, 500, gpu_period)
         self.perf_monitor.cpu_vals_changed.connect(self.update_cpu_bars)
-        if torch.cuda.is_available():
+        if gpu_available:
             self.perf_monitor.gpu_vals_changed.connect(self.update_gpu_bars)
         self.perf_monitor.start()
 
@@ -547,37 +553,12 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
             self.progress_dialog = ClearMap.gui.dialog_helpers.make_nested_progress_dialog(
                 title=title, overall_maximum=n_steps,
                 abort_callback=abort, parent=parent)
-
-            # Dialog-bound slots — disconnect_all because target widget changes each call
-            unique_connect(self.progress_watcher.main_max_changed,
-                           self.progress_dialog.mainProgressBar.setMaximum,
-                           disconnect_all=True)
-            unique_connect(self.progress_watcher.main_progress_changed,
-                           self.progress_dialog.mainProgressBar.setValue,
-                           disconnect_all=True)
-
-            # Stable slot — just ensure no duplicate
-            unique_connect(self.progress_watcher.main_step_name_changed,
-                           self.handle_step_name_change)
         else:
             nested = False
             self.progress_dialog = ClearMap.gui.dialog_helpers.make_simple_progress_dialog(
                 title=title, abort_callback=abort, parent=parent)
 
-        # Dialog-bound slots — disconnect_all because target widget changes each call
-        unique_connect(self.progress_watcher.max_changed,
-                       self.progress_dialog.subProgressBar.setMaximum,
-                       disconnect_all=True)
-        unique_connect(self.progress_watcher.progress_changed,
-                       self.progress_dialog.subProgressBar.setValue,
-                       disconnect_all=True)
-
-        # Stable slots — just ensure no duplicate
-        unique_connect(self.progress_watcher.sub_step_name_changed,
-                       self.handle_sub_step_change)
-        unique_connect(self.progress_watcher.finished,
-                       self.signal_process_finished)
-
+        # The dialog follows the watcher through the events (see _subscribe_the_progress_dialog)
         if nested:
             self.progress_watcher.setup(main_step_name=title, main_step_length=n_steps)
         else:
@@ -587,6 +568,45 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
 
     def set_tabs_progress_watchers(self, nested: bool = False):
         raise NotImplementedError()
+
+    def _subscribe_the_progress_dialog(self):
+        """
+        The current progress dialog follows the progress watcher. The handlers run in the GUI thread (they touch
+        widgets): the watcher publishes from the processing thread and from its log poller.
+        """
+        for event_type, handler in ((ProgressMainMaximumChanged, self._set_main_progress_maximum),
+                                    (ProgressMainValueChanged, self._set_main_progress_value),
+                                    (ProgressSubMaximumChanged, self._set_sub_progress_maximum),
+                                    (ProgressSubValueChanged, self._set_sub_progress_value),
+                                    (ProgressMainStepNameChanged, self._on_main_step_name_changed),
+                                    (ProgressSubStepNameChanged, self._on_sub_step_name_changed),
+                                    (ProgressFinished, self._on_progress_finished)):
+            self.bus.subscribe(event_type, handler, affinity=GUI_THREAD)
+
+    def _set_main_progress_maximum(self, event: ProgressMainMaximumChanged):
+        if self.progress_dialog is not None:
+            self.progress_dialog.mainProgressBar.setMaximum(event.maximum)
+
+    def _set_main_progress_value(self, event: ProgressMainValueChanged):
+        if self.progress_dialog is not None:
+            self.progress_dialog.mainProgressBar.setValue(event.value)
+
+    def _set_sub_progress_maximum(self, event: ProgressSubMaximumChanged):
+        if self.progress_dialog is not None:
+            self.progress_dialog.subProgressBar.setMaximum(event.maximum)
+
+    def _set_sub_progress_value(self, event: ProgressSubValueChanged):
+        if self.progress_dialog is not None:
+            self.progress_dialog.subProgressBar.setValue(event.value)
+
+    def _on_main_step_name_changed(self, event: ProgressMainStepNameChanged):
+        self.handle_step_name_change(event.name)
+
+    def _on_sub_step_name_changed(self, event: ProgressSubStepNameChanged):
+        self.handle_sub_step_change(event.name)
+
+    def _on_progress_finished(self, event: ProgressFinished):
+        self.signal_process_finished(event.main_step_name)
 
     def wrap_in_thread(self, func: Callable, *args, **kwargs):
         """
@@ -606,15 +626,7 @@ class ClearMapAppBase(QMainWindow, Ui_ClearMapGui):
         -------
             The result of the execution of the function func
         """
-        self.progress_watcher.start_polling()
-        with ThreadPool(processes=1) as pool:
-            result = pool.apply_async(func, args, kwargs)
-            while not result.ready():
-                result.wait(0.25)
-                self.app.processEvents()
-        self.progress_watcher.stop_polling()
-        self.progress_watcher.finish()
-        return result.get()
+        return base_utils.run_with_responsive_ui(self.app, self.progress_watcher, func, *args, **kwargs)
 
     def signal_process_finished(self, msg: str = 'Idle, waiting for input'):
         """
@@ -720,9 +732,8 @@ class ClearMapApp(ClearMapAppBase):
     tabs derived from GenericTab , which correspond to different steps of the program.
     """
     def __init__(self, experiment_controller, bus, gui_controller):
-        super().__init__()
+        super().__init__(bus)
         self.experiment_controller = experiment_controller
-        self.bus = bus
         self.gui_controller = gui_controller
 
         self.setupUi(self)
@@ -759,7 +770,7 @@ class ClearMapApp(ClearMapAppBase):
         if not os.path.exists(CLEARMAP_CFG_DIR):
             update_default_config()
 
-        self.bus.subscribe(TabsUpdated, self._on_tabs_updated)
+        self.bus.subscribe(TabsUpdated, self._on_tabs_updated, affinity=GUI_THREAD)
 
     def reset(self):
         self.config_loader = ConfigHandler('')
@@ -1298,6 +1309,9 @@ class GuiController(BusSubscriberMixin):
     installing the tabs and handling events from the EventBus.
     It interacts with the ExperimentController to manage the business logic of the application.
     """
+    subscriber_affinity = GUI_THREAD  # The handlers build and refresh the tabs
+    MAX_TABS_INSTALL_PASSES = 3  # Installs in a row; a replay happens only if the valid tabs really changed
+
     def __init__(self, bus: EventBus, experiment, tab_registry: TabRegistry,
                  group_controller: AnalysisGroupController):
         super().__init__(bus)
@@ -1318,6 +1332,11 @@ class GuiController(BusSubscriberMixin):
         # Hydration state flags
         self._needs_full_refresh: bool = False
         self._tabs_initialized: bool = False
+        self._reconciled_registry = None  # The channel registry the tabs last followed (see end_hydration)
+
+        # Re-entrancy guard for _install_or_update_tabs
+        self._installing_tabs: bool = False
+        self._tabs_install_requested: bool = False
 
         self.subscribe(CfgChanged, self._on_cfg_changed)
         self.subscribe(UiRequestRefreshTabs, self._on_refresh_tabs)
@@ -1350,12 +1369,16 @@ class GuiController(BusSubscriberMixin):
         self._needs_full_refresh = False
 
     def end_hydration(self):
-        self._hydrating = False
-        if self._needs_full_refresh or not self._tabs_initialized:
+        # A directory load replaces the channel registry (SampleManager.setup): the tabs must follow the new one
+        registry_replaced = self.experiment_controller.sample_manager.channel_registry is not self._reconciled_registry
+        needs_refresh = self._needs_full_refresh or not self._tabs_initialized or registry_replaced
+        if needs_refresh:
+            # Still hydrating: the CfgChanged emitted by this submit is deferred to the install below
             self.experiment_controller.cfg_coordinator.submit(  # Force adjusters and validators to run after hydration, to ensure UI is in sync with model
-                sample_manager=self.experiment_controller.sample_manager,
-                do_run_adjusters=True, validate=True, commit=True)
+                sample_manager=self.experiment_controller.sample_manager)
+        self._hydrating = False
 
+        if needs_refresh:
             self._install_or_update_tabs()
             self._tabs_initialized = True
             self._refresh_tabs_from_model()
@@ -1426,7 +1449,35 @@ class GuiController(BusSubscriberMixin):
         """
         Decide which tabs exist (via TabRegistry + validators/materializers),
         create or reuse instances, inject callbacks, and notify UI.
+
+        .. warning::
+            Creating a tab can write to the config (e.g. ``Params.add_channel``), which publishes
+            CfgChanged synchronously and may request a tab update while this one is still running
+            (``self._tabs`` not yet updated). Nesting would recreate the tab being built, forever.
+            Such requests are recorded and replayed once this update is done, if they would
+            change anything (see _tabs_install_pending).
         """
+        if self._installing_tabs:
+            self._tabs_install_requested = True
+            return
+        self._installing_tabs = True
+        try:
+            for _ in range(self.MAX_TABS_INSTALL_PASSES):
+                self._tabs_install_requested = False
+                self._install_tabs_once()
+                if not self._tabs_install_pending():
+                    break
+            else:
+                warnings.warn(f'The valid tabs still changed after {self.MAX_TABS_INSTALL_PASSES} installs. '
+                              f'Stopping to avoid an infinite loop.', RuntimeWarning)
+        finally:
+            self._installing_tabs = False
+
+    def _tabs_install_pending(self) -> bool:
+        """Whether a request recorded during the last install would change anything (stale ones are dropped)."""
+        return self._tabs_install_requested and (self._needs_tab_reset or self._valid_tab_set_changed())
+
+    def _install_tabs_once(self) -> None:
         if self._needs_tab_reset:
             self._tabs = []  # empties the lookup before _build_tabs_from_registry
             self._tabs_initialized = False
@@ -1497,7 +1548,15 @@ class GuiController(BusSubscriberMixin):
             if self._data_type_change_affects_tabs(changed_keys, channels):
                 return True
 
-        return False
+        # Catch-all: tab requirements also depend on facts the keys above don't cover
+        #   (e.g. a tiled path makes the 'stitching' section required)
+        return self._valid_tab_set_changed()
+
+    def _valid_tab_set_changed(self) -> bool:
+        """Whether the tabs the registry would show now differ from the installed ones."""
+        valid = set(self.tabs_registry.valid_tabs(mode=self.mode, sample_manager=self.sample_manager,
+                                                  group_controller=self.group_controller))
+        return valid != {type(t) for t in self._tabs}
 
     def _has_orphaned_pipeline_tabs(self) -> bool:
         """Check if any pipeline tab no longer has channels to serve."""
@@ -1550,11 +1609,8 @@ class GuiController(BusSubscriberMixin):
             if self._tabs_may_have_changed(evt.changed_keys):
                 self._needs_full_refresh = True
         else:  # Normal operation
-            # Ensure workspace/runtime state is reconciled before tab rebuilds
-            # that may instantiate workers reading from workspace.
-            if self.sample_manager is not None:
-                self.sample_manager.update_workspace()
-
+            # WARNING: Do not update the workspace here: SampleManager syncs it on every config commit,
+            #  before CfgChanged is published
             if self._tabs_may_have_changed(evt.changed_keys):  # Infer if channels/types changed
                 self._install_or_update_tabs()
                 self._tabs_initialized = True
@@ -1574,8 +1630,9 @@ class GuiController(BusSubscriberMixin):
         for tab in self._tabs:
             # REFACTOR: hide behind refresh() method on GenericTab?
             # FIXME: this will blow up. fix in cfg_to_ui but params must have ref to owner tab
-            tab._create_channels()  # Ensure channel tabs and params are up to date
+            tab.reconcile_channel_pages()  # Channel pages and params follow the config
             tab.params.cfg_to_ui()
+        self._reconciled_registry = self.experiment_controller.sample_manager.channel_registry
 
     def _handle_tab_activation(self, tab_key: str) -> Tuple[bool, str]:
         """
@@ -1675,6 +1732,7 @@ def build_business_objects(bus: EventBus):
 
 def main(app_, splash_):
     bus = EventBus()
+    bus.set_delivery(GUI_THREAD, GuiThreadDelivery())  # Created here, in the GUI thread
     experiment, group_controller = build_business_objects(bus)
     tab_registry = TabRegistry()
     gui = GuiController(bus, experiment, tab_registry, group_controller)
